@@ -1,0 +1,209 @@
+# Airflow with Temporal Orchestrator
+#
+# This docker-compose runs Airflow with Temporal as the workflow orchestrator.
+# DAG execution is handled by Temporal workflows instead of Airflow's scheduler.
+#
+# Components:
+#   - temporal: Temporal server (workflow orchestration)
+#   - postgres: Database for Airflow metadata
+#   - airflow-apiserver: Airflow UI and REST API
+#   - airflow-dag-processor: Parses DAG files
+#   - airflow-scheduler: Creates scheduled DagRuns (routes to Temporal)
+#   - temporal-worker: Executes DAGs via Temporal workflows
+#
+# What's different from standard Airflow:
+#   - Scheduler creates DagRuns but doesn't execute tasks
+#   - Temporal worker executes all task logic
+#   - DagRuns are marked as EXTERNAL so scheduler doesn't interfere
+#
+# Usage:
+#   # Build the image first (from temporal-airflow repo root):
+#   docker build -t airflow-temporal:latest -f docker/Dockerfile .
+#
+#   # Start services:
+#   cd docker
+#   docker-compose up -d
+#
+#   # View logs:
+#   docker-compose logs -f
+#
+# Access:
+#   - Airflow UI: http://localhost:8080
+#   - Temporal UI: http://localhost:8233
+#
+---
+x-airflow-common:
+  &airflow-common
+  image: ${AIRFLOW_IMAGE_NAME:-airflow-temporal:latest}
+  environment:
+    &airflow-common-env
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__SCHEDULER__STANDALONE_DAG_PROCESSOR: 'true'
+    AIRFLOW__CORE__EXECUTOR: 'airflow.executors.local_executor.LocalExecutor'
+    # Auth configuration (bypass login for dev)
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: 'true'
+    # Temporal configuration
+    TEMPORAL_ADDRESS: temporal:7233
+    TEMPORAL_NAMESPACE: default
+    TEMPORAL_TASK_QUEUE: airflow-tasks
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    postgres:
+      condition: service_healthy
+    temporal:
+      condition: service_healthy
+
+services:
+  # =============================================================================
+  # Temporal Server (Development Mode)
+  # =============================================================================
+  temporal:
+    image: temporalio/admin-tools:latest
+    container_name: temporal
+    ports:
+      - "7233:7233"   # gRPC API
+      - "8233:8233"   # Web UI
+    entrypoint: []
+    command: ["temporal", "server", "start-dev", "--ip", "0.0.0.0", "--db-filename", "/tmp/temporal.db"]
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "localhost:7233"]
+      interval: 10s
+      timeout: 10s
+      start_period: 30s
+      retries: 30
+    restart: always
+
+  # =============================================================================
+  # PostgreSQL for Airflow Metadata
+  # =============================================================================
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  # =============================================================================
+  # Airflow Initialization
+  # =============================================================================
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        echo "Creating directories..."
+        mkdir -p /opt/airflow/{logs,dags}
+        echo "Initializing Airflow database..."
+        airflow db migrate
+        echo "Airflow initialization complete!"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # =============================================================================
+  # Airflow API Server (UI)
+  # Routes DagRuns to Temporal via orchestrator
+  # =============================================================================
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: airflow-apiserver
+    command: ["airflow", "api-server"]
+    ports:
+      - "8080:8080"
+    environment:
+      <<: *airflow-common-env
+      # Route all DagRuns to Temporal
+      AIRFLOW__CORE__ORCHESTRATOR: temporal_airflow.orchestrator.TemporalOrchestrator
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # =============================================================================
+  # Airflow DAG Processor
+  # Parses DAG files and stores serialized DAGs in database
+  # =============================================================================
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    command: ["airflow", "dag-processor"]
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # =============================================================================
+  # Airflow Scheduler
+  # Creates DagRuns based on timetables, routes to Temporal
+  # =============================================================================
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: ["airflow", "scheduler"]
+    environment:
+      <<: *airflow-common-env
+      # Route all DagRuns to Temporal
+      AIRFLOW__CORE__ORCHESTRATOR: temporal_airflow.orchestrator.TemporalOrchestrator
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # =============================================================================
+  # Temporal Worker for Airflow DAG Execution
+  # Runs deep integration workflow + activities
+  # =============================================================================
+  temporal-worker:
+    <<: *airflow-common
+    container_name: temporal-worker
+    command: ["python", "-m", "temporal_airflow.deep_worker"]
+    environment:
+      <<: *airflow-common-env
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f deep_worker || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-db-volume:
