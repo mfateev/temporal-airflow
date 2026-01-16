@@ -16,49 +16,94 @@ This document describes **Deep Integration Mode** - a deployment model where:
 
 **Key Principle**: Temporal owns execution, Airflow owns user experience.
 
-**Implementation Approach**: Direct database access via Airflow models, requiring only **~7 lines of Airflow code changes** to mark externally-managed runs.
+### Core Architectural Decision: In-Workflow Database + Sync Activities
+
+Deep integration follows the **same design as standalone mode** with one key addition:
+
+1. **In-Workflow Database**: Each workflow has its own in-memory SQLite database with real Airflow models (DagRun, TaskInstance, etc.)
+2. **Reuse Airflow's Native Logic**: All scheduling decisions use Airflow's built-in code:
+   - `dag_run.update_state()` - evaluates trigger rules via TriggerRuleDep
+   - `dag_run.verify_integrity()` - creates TaskInstance records
+   - `dag_run.schedule_tis()` - schedules tasks
+3. **Sync Activities**: Write state from in-workflow DB to real Airflow DB for UI visibility
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Temporal Workflow                                               │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  In-Workflow Database (SQLite in-memory)                   │  │
+│  │  ├── DagRun (real Airflow model)                          │  │
+│  │  ├── TaskInstance (real Airflow model)                    │  │
+│  │  └── Uses Airflow's native: update_state(), TriggerRuleDep│  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                              │                                   │
+│                              │ sync_task_status() activity       │
+│                              ▼                                   │
+└──────────────────────────────┼───────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Airflow Database (PostgreSQL/MySQL)                             │
+│  ├── DagRun (synced for UI visibility)                          │
+│  ├── TaskInstance (synced for UI visibility)                    │
+│  ├── Connections (read by hooks during task execution)          │
+│  └── Variables (read by operators during task execution)        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Why this design?**
+- **Correctness**: Reusing Airflow's trigger rule logic guarantees identical behavior to the built-in scheduler
+- **Maintainability**: No need to reimplement and maintain separate scheduling logic
+- **Consistency**: Both standalone and deep integration use the same workflow code path
+
+### What Changes Where
+
+| Layer | Component | Change Required |
+|-------|-----------|-----------------|
+| **Airflow Core** | `DagRunType` enum | Add `EXTERNAL` value (~3 lines) |
+| **Airflow Core** | Scheduler queries | Filter out `EXTERNAL` runs (~4 lines) |
+| **Airflow Core** | DagRun Orchestrator (future) | Pluggable extension point (~140 lines) |
+| **Temporal** | Workflow | `ExecuteAirflowDagWorkflow` - orchestrates DAG execution |
+| **Temporal** | Activities | DB sync, task execution, DagRun creation |
+| **Temporal** | Trigger Service | Starts workflows for scheduled DAGs |
+
+### Implementation Approaches
+
+**Minimal Approach (~7 lines Airflow changes):**
+- Add `DagRunType.EXTERNAL` + scheduler filter
+- External Trigger Service polls for due DAGs and starts workflows
+- Workflows write status back to Airflow DB
+
+**Full Integration (~140 lines Airflow changes):**
+- Add pluggable DagRun Orchestrator extension point
+- `TemporalOrchestrator` routes all DagRuns to Temporal workflows
+- No external Trigger Service needed - works with existing UI/API/CLI
 
 ---
 
-## Required Airflow Changes (Minimal)
+## Table of Contents
 
-To enable external execution while preventing the scheduler from interfering, only **two small changes** are needed in the Airflow codebase:
-
-### Change 1: Add EXTERNAL to DagRunType Enum (~3 lines)
-
-```python
-# airflow/utils/types.py
-
-class DagRunType(str, enum.Enum):
-    """Class with DagRun types."""
-    BACKFILL_JOB = "backfill"
-    SCHEDULED = "scheduled"
-    MANUAL = "manual"
-    ASSET_TRIGGERED = "asset_triggered"
-    EXTERNAL = "external"  # ← ADD THIS: Externally managed (Temporal, etc.)
-```
-
-### Change 2: Filter External Runs from Scheduler (~4 lines)
-
-```python
-# airflow/models/dagrun.py
-
-# In get_running_dag_runs_to_examine() method (line ~595):
-query = (
-    select(cls)
-    .where(cls.state == DagRunState.RUNNING)
-    .where(cls.run_type != DagRunType.EXTERNAL)  # ← ADD THIS
-    # ... rest of query
-)
-
-# In get_queued_dag_runs_to_set_running() method (line ~635):
-# Same filter added
-```
-
-**That's it.** With these changes:
-- External systems create DagRuns with `run_type='external'`
-- Airflow scheduler completely ignores these runs
-- Temporal has full control over execution and state management
+1. [Design Principles](#design-principles)
+2. [Architecture Overview](#architecture-overview)
+3. **[Part A: Airflow Changes](#part-a-airflow-changes)**
+   - [Minimal Changes: DagRunType.EXTERNAL](#minimal-changes-dagruntype-external)
+   - [Extension Point: Pluggable DagRun Orchestrator](#extension-point-pluggable-dagrun-orchestrator)
+4. **[Part B: Temporal Components](#part-b-temporal-components)**
+   - [Workflow: ExecuteAirflowDagWorkflow](#workflow-executeairflowdagworkflow)
+   - [Activity: create_dagrun_record](#activity-create_dagrun_record)
+   - [Activity: sync_task_status / sync_dagrun_status](#activity-sync_task_status--sync_dagrun_status)
+   - [Activity: run_airflow_task](#activity-run_airflow_task)
+   - [Trigger Service](#trigger-service)
+5. [Data Flow](#data-flow)
+6. [Configuration](#configuration)
+7. [Deployment Architecture](#deployment-architecture)
+8. [Implementation Phases](#implementation-phases)
+9. [Benefits](#benefits)
+10. [Challenges and Mitigations](#challenges-and-mitigations)
+11. [Migration Path](#migration-path)
+12. [Appendix: Executor Pattern Background](#appendix-executor-pattern-background)
+13. [Appendix: Executor Delegation (Future)](#appendix-executor-delegation-future)
+14. [Appendix: HTTP API Approach (Future)](#appendix-http-api-approach-future)
 
 ---
 
@@ -102,7 +147,7 @@ query = (
 │  └────────────────────────────────────└─────────────┘ └─────────────┘─┘│
 └─────────────────────────────────────────────────────────────────────────┘
                     │                              ▲
-                    │ read config                  │ write status (workflow creates records)
+                    │ read config                  │ write status
                     ▼                              │
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                        TEMPORAL LAYER                                    │
@@ -118,34 +163,15 @@ query = (
 │  │                      TEMPORAL WORKERS                             │  │
 │  │                                                                   │  │
 │  │  ExecuteAirflowDagWorkflow                                        │  │
-│  │  ├─ FIRST: create_dagrun_record activity (creates DB records)    │  │
-│  │  ├─ Deserialize DAG from input                                    │  │
-│  │  ├─ Resolve task dependencies                                     │  │
-│  │  ├─ Start activities for ready tasks                              │  │
-│  │  ├─ Handle completions/failures                                   │  │
-│  │  └─ Call sync_status activity → updates Airflow DB                │  │
-│  │                                                                   │  │
-│  │  create_dagrun_record Activity (FIRST activity)                   │  │
-│  │  ├─ Creates DagRun with run_type=EXTERNAL, state=RUNNING         │  │
-│  │  ├─ Creates TaskInstance records for all tasks                    │  │
-│  │  └─ Returns run_id (scheduler ignores EXTERNAL runs)              │  │
-│  │                                                                   │  │
-│  │  run_airflow_task Activity                                        │  │
-│  │  ├─ Load operator from DAG file
-                        │  │
-│  │  ├─ Hooks read connections from Airflow DB (standard path)        │  │
-│  │  ├─ Execute operator.execute()                                    │  │
-│  │  └─ Return result + XCom                                          │  │
-│  │                                                                   │  │
-│  │  sync_task_status Activity                                        │  │
-│  │  └─ Update TaskInstance state in Airflow DB                       │  │
+│  │  ├─ FIRST: create_dagrun_record activity                         │  │
+│  │  ├─ Deserialize DAG, resolve dependencies                        │  │
+│  │  ├─ Execute tasks via run_airflow_task activity                  │  │
+│  │  └─ Sync status via sync_task_status activity                    │  │
 │  └───────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
----
-
-## Comparison: Traditional vs Deep Integration
+### Comparison: Traditional vs Deep Integration
 
 | Component | Traditional Airflow | Deep Integration |
 |-----------|--------------------|-----------------------|
@@ -157,271 +183,438 @@ query = (
 | **Task state machine** | DB-driven, scheduler-managed | Temporal workflow state |
 | **Retries/timeouts** | Scheduler-managed | Temporal-managed |
 | **Connections** | Stored in DB, read by hooks | **Unchanged** - hooks read from DB |
-| **Variables** | Stored in DB | **Unchanged** - read from DB |
-| **XCom** | Stored in DB | Workflow state + synced to DB |
-| **Pools** | DB-enforced limits | Read from DB, enforced by workflow |
 
 ---
 
-## Data Flow
+# Part A: Airflow Changes
 
-### Flow 1: User Triggers DAG Run
-
-```
-1. User clicks "Trigger DAG" in Airflow UI
-                    │
-                    ▼
-2. Airflow API starts Temporal workflow DIRECTLY
-   - Passes dag_id, conf, logical_date
-   - Workflow ID = "airflow-{dag_id}-{logical_date}"
-   - NO database write yet!
-                    │
-                    ▼
-3. Workflow's FIRST activity: create_dagrun_record
-   - Creates DagRun in DB with state = RUNNING
-   - Sets run_type = EXTERNAL (scheduler ignores this run!)
-   - Creates TaskInstance records for all tasks
-   - Returns run_id for subsequent activities
-                    │
-                    ▼
-4. Workflow executes tasks via activities
-   - Each completion triggers sync_task_status
-   - UI shows real-time updates
-                    │
-                    ▼
-5. Workflow completes, calls sync_dagrun_status
-   - Updates DagRun state = SUCCESS/FAILED
-                    │
-                    ▼
-6. User sees final state in Airflow UI
-```
-
-**Why workflow-first?**
-- **No orphan records**: If workflow fails to start, no stale DagRun in DB
-- **Atomic**: Record creation is part of the durable workflow
-- **Simpler API**: Just calls Temporal, no DB transaction + workflow coordination
-- **Single source of truth**: Temporal owns execution from the very beginning
-
-### Flow 2: Task Execution with Connections
-
-```
-Workflow identifies task ready for execution
-                    │
-                    ▼
-Workflow starts run_airflow_task activity
-                    │
-                    ▼
-Activity loads DAG file, extracts operator
-                    │
-                    ▼
-Operator executes, hook needs connection
-                    │
-                    ▼
-Hook calls BaseHook.get_connection("my_conn")
-                    │
-                    ▼
-Airflow's connection lookup reads from DB
-   - Uses AIRFLOW__DATABASE__SQL_ALCHEMY_CONN
-   - Standard Airflow path, zero changes needed!
-                    │
-                    ▼
-Operator completes, returns result
-                    │
-                    ▼
-Activity returns TaskExecutionResult to workflow
-                    │
-                    ▼
-Workflow calls sync_task_status activity
-   - Writes state to TaskInstance table
-   - Writes XCom to xcom table
-                    │
-                    ▼
-Airflow UI shows updated task state
-```
-
-### Flow 3: Schedule-Based Execution
-
-```
-1. Airflow Scheduler parses DAG files (unchanged)
-   - Evaluates timetables/schedules
-   - Determines next logical_date
-                    │
-                    ▼
-2. Temporal Schedule Service (replaces scheduler's triggering)
-   - Uses Temporal Schedules feature OR
-   - Polls serialized_dag table for due schedules
-   - Starts workflow directly (no DagRun created yet)
-                    │
-                    ▼
-3. Workflow's FIRST activity: create_dagrun_record
-   - Creates DagRun with run_type = EXTERNAL
-   - state = RUNNING (scheduler ignores this run!)
-   - Returns run_id
-                    │
-                    ▼
-4. (Same as Flow 1, step 4 onwards)
-```
-
-**Alternative: Temporal Native Schedules**
-```
-1. DAG schedule info stored in Temporal as a Schedule
-   - Temporal handles cron evaluation natively
-   - No need for Airflow scheduler for triggering
-                    │
-                    ▼
-2. Temporal Schedule triggers workflow at scheduled time
-   - Passes dag_id, logical_date from schedule
-                    │
-                    ▼
-3. (Same as above - workflow creates DagRun)
-```
+This section describes all changes required in the Airflow codebase.
 
 ---
 
-## Implementation Components
+## Minimal Changes: DagRunType.EXTERNAL
 
-### Component 1: Temporal Schedule Trigger Service
+**Total: ~7 lines of code**
 
-Evaluates DAG schedules and starts Temporal workflows directly (workflow creates DagRun):
+These changes allow external systems to create DagRuns that the scheduler ignores.
+
+### Change 1: Add EXTERNAL to DagRunType Enum (~3 lines)
 
 ```python
-# airflow-core/src/airflow/executors/temporal_schedule_trigger.py
+# airflow/utils/types.py
 
-class TemporalScheduleTrigger:
-    """
-    Evaluates DAG schedules and starts Temporal workflows.
-
-    Key design: Workflow creates the DagRun record, not this service.
-    This ensures no orphan DagRuns if workflow fails to start.
-
-    The scheduler still handles:
-    - DAG file parsing
-    - Serializing DAGs to database
-
-    This service handles:
-    - Schedule evaluation (which DAGs are due)
-    - Starting Temporal workflows
-    """
-
-    def __init__(self):
-        self.temporal_client: Client | None = None
-        self.running: bool = False
-
-    async def start(self):
-        """Initialize and start the trigger service."""
-        self.temporal_client = await create_temporal_client()
-        self.running = True
-
-        log.info("Temporal schedule trigger started")
-        log.info(f"  Temporal: {self.temporal_client.service_client.config.target_host}")
-        log.info(f"  Task queue: {conf.get('temporal', 'task_queue')}")
-
-        await self._run_loop()
-
-    async def _run_loop(self):
-        """Main loop - check for due schedules."""
-        task_queue = conf.get("temporal", "task_queue", fallback="airflow-tasks")
-
-        while self.running:
-            try:
-                await self._process_due_schedules(task_queue)
-            except Exception as e:
-                log.exception(f"Error processing schedules: {e}")
-
-            await asyncio.sleep(1)
-
-    async def _process_due_schedules(self, task_queue: str):
-        """Find DAGs due for execution and start workflows."""
-        with create_session() as session:
-            # Find active DAGs with schedules
-            active_dags = session.query(SerializedDagModel).filter(
-                SerializedDagModel.is_active == True,
-            ).all()
-
-            for dag_model in active_dags:
-                if self._is_due(dag_model):
-                    logical_date = self._calculate_logical_date(dag_model)
-                    await self._start_workflow(
-                        dag_model, logical_date, task_queue, run_type="scheduled"
-                    )
-
-    async def _start_workflow(
-        self,
-        dag_model: SerializedDagModel,
-        logical_date: datetime,
-        task_queue: str,
-        run_type: str = "manual",
-        conf: dict | None = None,
-    ):
-        """Start Temporal workflow - workflow will create DagRun."""
-        # Workflow ID uses logical_date (run_id assigned by workflow)
-        workflow_id = f"airflow-{dag_model.dag_id}-{logical_date.isoformat()}"
-
-        # Check if workflow already exists (idempotency)
-        # Temporal will reject duplicate workflow IDs
-
-        input_data = DagExecutionInput(
-            dag_id=dag_model.dag_id,
-            logical_date=logical_date,
-            serialized_dag=dag_model.data,
-            conf=conf or {},
-            run_type=run_type,
-            # run_id is NOT set - workflow's first activity will generate it
-        )
-
-        await self.temporal_client.start_workflow(
-            ExecuteAirflowDagWorkflow.run,
-            input_data,
-            id=workflow_id,
-            task_queue=task_queue,
-        )
-
-        log.info(f"Started workflow {workflow_id} for {dag_model.dag_id}")
+class DagRunType(str, enum.Enum):
+    """Class with DagRun types."""
+    BACKFILL_JOB = "backfill"
+    SCHEDULED = "scheduled"
+    MANUAL = "manual"
+    ASSET_TRIGGERED = "asset_triggered"
+    EXTERNAL = "external"  # ← ADD THIS: Externally managed (Temporal, etc.)
 ```
 
-### Component 2: DagRun Creation Activity (Direct DB Access)
-
-The workflow's first activity creates the DagRun record using **direct database access** via Airflow models. This approach:
-- Has no REST API limitations (can set any state including RUNNING)
-- Can create TaskInstance records directly
-- Uses `run_type='external'` so scheduler ignores this run
+### Change 2: Filter External Runs from Scheduler (~4 lines)
 
 ```python
-# scripts/temporal_airflow/activities.py (additions)
+# airflow/models/dagrun.py
 
-import os
-# Configure Airflow database connection
-os.environ.setdefault(
-    "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN",
-    "postgresql://airflow:airflow@localhost:5432/airflow"
+# In get_running_dag_runs_to_examine() method (line ~595):
+query = (
+    select(cls)
+    .where(cls.state == DagRunState.RUNNING)
+    .where(cls.run_type != DagRunType.EXTERNAL)  # ← ADD THIS
+    # ... rest of query
 )
 
-from airflow import settings
-from airflow.models import DagRun, TaskInstance
-from airflow.models.serialized_dag import SerializedDagModel
-from airflow.utils.session import create_session
-from airflow.utils.state import TaskInstanceState, DagRunState
-from airflow.utils.types import DagRunType
+# In get_queued_dag_runs_to_set_running() method (line ~635):
+# Same filter added
+```
 
-# Initialize ORM (required for external code)
-settings.configure_orm()
+### What These Changes Enable
 
+- External systems create DagRuns with `run_type='external'`
+- Airflow scheduler completely ignores these runs
+- Temporal has full control over execution and state management
+
+### What These Changes Do NOT Provide
+
+- No hook/extension point for starting workflows when DAGs are triggered
+- Still need external Trigger Service, modified API, or pluggable orchestrator
+
+---
+
+## Extension Point: Pluggable DagRun Orchestrator
+
+**Total: ~140 lines of code**
+
+This is a cleaner long-term solution that provides an extension point in Airflow itself, similar to pluggable executors.
+
+### Problem: No Extension Point
+
+When a user triggers a DAG (UI, API, CLI, or schedule), Airflow:
+1. Creates a `DagRun` record directly in the database
+2. Scheduler picks it up and manages task execution via the configured executor
+
+**There's no hook to intercept DagRun creation and route it to an external orchestrator.**
+
+Existing listener hooks (`on_dag_run_running`, `on_dag_run_success`, etc.) only fire on **state changes**, not on creation.
+
+### Solution: System-Wide Pluggable Orchestrator
+
+Configure the orchestrator system-wide in `airflow.cfg`:
+
+```ini
+[core]
+# System-wide orchestrator selection (like executor)
+orchestrator = TemporalOrchestrator
+# OR: orchestrator = DefaultOrchestrator (current behavior)
+```
+
+### Base Interface (~40 lines)
+
+```python
+# airflow/orchestrators/base_orchestrator.py
+
+from abc import ABC, abstractmethod
+from airflow.models import DagRun
+
+class BaseDagRunOrchestrator(ABC):
+    """
+    Base class for DagRun orchestrators.
+
+    Orchestrators control how DagRuns are executed. The default orchestrator
+    uses Airflow's scheduler + executor pattern. Alternative orchestrators
+    route execution to external systems like Temporal.
+
+    Configured system-wide via [core] orchestrator setting.
+    """
+
+    @abstractmethod
+    def start_dagrun(self, dag_run: DagRun) -> None:
+        """
+        Start orchestrating a DagRun.
+
+        Called when a DagRun is created/triggered. The orchestrator is
+        responsible for managing the execution of all tasks in the DAG.
+        """
+        pass
+
+    @abstractmethod
+    def cancel_dagrun(self, dag_run: DagRun) -> None:
+        """Cancel a running DagRun."""
+        pass
+
+
+class DefaultOrchestrator(BaseDagRunOrchestrator):
+    """Default orchestrator - uses Airflow scheduler + executor."""
+
+    def start_dagrun(self, dag_run: DagRun) -> None:
+        # No-op: Scheduler will pick up the DagRun automatically
+        pass
+
+    def cancel_dagrun(self, dag_run: DagRun) -> None:
+        dag_run.set_state(DagRunState.FAILED)
+```
+
+### Orchestrator Loader (~20 lines)
+
+```python
+# airflow/orchestrators/orchestrator_loader.py
+
+_orchestrator: BaseDagRunOrchestrator | None = None
+
+def get_orchestrator() -> BaseDagRunOrchestrator:
+    """Get the configured orchestrator (singleton)."""
+    global _orchestrator
+    if _orchestrator is None:
+        orchestrator_name = conf.get("core", "orchestrator", fallback="DefaultOrchestrator")
+        _orchestrator = import_string(ORCHESTRATOR_CLASSES[orchestrator_name])()
+    return _orchestrator
+```
+
+### Integration Point (~5 lines)
+
+```python
+# airflow/models/dagrun.py (or API layer)
+
+def create_dagrun(...) -> DagRun:
+    dag_run = DagRun(...)
+    session.add(dag_run)
+    session.flush()
+
+    # NEW: Start via configured orchestrator
+    orchestrator = get_orchestrator()
+    orchestrator.start_dagrun(dag_run)
+
+    return dag_run
+```
+
+### TemporalOrchestrator Implementation (~60 lines)
+
+```python
+# airflow/providers/temporal/orchestrators/temporal_orchestrator.py
+
+class TemporalOrchestrator(BaseDagRunOrchestrator):
+    """Routes ALL DagRun execution to Temporal workflows."""
+
+    def __init__(self):
+        self.client: Client | None = None
+
+    async def start_dagrun(self, dag_run: DagRun) -> None:
+        """Start Temporal workflow for this DagRun."""
+        if not self.client:
+            self.client = await create_temporal_client()
+
+        # Mark as EXTERNAL so scheduler ignores it
+        dag_run.run_type = DagRunType.EXTERNAL
+
+        await self.client.start_workflow(
+            ExecuteAirflowDagWorkflow.run,
+            DagExecutionInput(
+                dag_id=dag_run.dag_id,
+                run_id=dag_run.run_id,
+                logical_date=dag_run.logical_date,
+                conf=dag_run.conf,
+            ),
+            id=f"airflow-{dag_run.dag_id}-{dag_run.run_id}",
+            task_queue=conf.get("temporal", "task_queue"),
+        )
+
+    async def cancel_dagrun(self, dag_run: DagRun) -> None:
+        """Cancel Temporal workflow."""
+        handle = self.client.get_workflow_handle(
+            f"airflow-{dag_run.dag_id}-{dag_run.run_id}"
+        )
+        await handle.cancel()
+```
+
+### Benefits of Orchestrator Extension Point
+
+| Aspect | Minimal Approach | Orchestrator Extension |
+|--------|------------------|------------------------|
+| **Airflow changes** | ~7 lines | ~140 lines |
+| **External components** | Trigger Service required | None needed |
+| **Works with UI/API/CLI** | Requires workarounds | Yes, natively |
+| **Configuration** | External service config | Single Airflow setting |
+| **Future extensibility** | Limited | Per-DAG routing possible |
+
+---
+
+# Part B: Temporal Components
+
+This section describes all Temporal-side components (no Airflow code changes).
+
+---
+
+## Workflow: ExecuteAirflowDagDeepWorkflow
+
+The deep integration workflow uses an **in-workflow database** and reuses Airflow's native scheduling logic,
+with sync activities to mirror state to the real Airflow DB for UI visibility.
+
+### Architecture: In-Workflow Database
+
+Deep integration uses the **same architecture as standalone mode**:
+
+```python
+# scripts/temporal_airflow/deep_workflow.py
+
+@workflow.defn(name="execute_airflow_dag_deep", sandboxed=False)
+class ExecuteAirflowDagDeepWorkflow:
+
+    def __init__(self):
+        # In-workflow database (same as standalone)
+        self.engine = None
+        self.sessionFactory = None
+        self.dag = None
+        self.xcom_store: dict[tuple, Any] = {}
+
+    def _initialize_database(self):
+        """Initialize workflow-specific in-memory SQLite database."""
+        workflow_id = workflow.info().workflow_id
+        conn_str = f"sqlite:///file:memdb_{workflow_id}?mode=memory&cache=shared&uri=true"
+        self.engine = create_engine(conn_str, poolclass=StaticPool, ...)
+        self.sessionFactory = sessionmaker(bind=self.engine, ...)
+        Base.metadata.create_all(self.engine)
+
+    @workflow.run
+    async def run(self, input: DeepDagExecutionInput) -> DagExecutionResult:
+        # 1. Initialize in-workflow database
+        self._initialize_database()
+
+        # 2. Load serialized DAG from Airflow DB (via activity)
+        dag_data = await workflow.execute_activity(
+            load_serialized_dag,
+            LoadSerializedDagInput(dag_id=input.dag_id),
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+        self.dag = SerializedDAG.from_dict(dag_data.dag_data)
+        self.dag_fileloc = dag_data.fileloc
+
+        # 3. Create DagRun in BOTH databases
+        # First: Create in real Airflow DB (if not exists)
+        create_result = await workflow.execute_activity(
+            create_dagrun_record,
+            CreateDagRunInput(dag_id=input.dag_id, logical_date=input.logical_date, ...),
+        )
+        self.run_id = create_result.run_id
+
+        # Then: Create in in-workflow DB (for Airflow's scheduling logic)
+        self._create_local_dag_run(...)
+
+        # 4. Ensure TaskInstances exist in real Airflow DB
+        await workflow.execute_activity(ensure_task_instances, ...)
+
+        # 5. Main scheduling loop (uses Airflow's native logic)
+        final_state = await self._scheduling_loop(...)
+
+        # 6. Sync final state
+        await workflow.execute_activity(sync_dagrun_status, ...)
+        return result
+```
+
+### Key Design: Reuse Airflow's Native Scheduling Logic
+
+The scheduling loop uses Airflow's built-in methods instead of custom logic:
+
+```python
+async def _scheduling_loop(self, dag_run_id: int) -> str:
+    """Uses Airflow's native scheduling logic."""
+
+    session = self.sessionFactory()
+    dag_run = session.query(DagRun).filter(DagRun.id == dag_run_id).one()
+    dag_run.dag = self.dag
+
+    # CRITICAL: Use Airflow's native update_state() method
+    # This internally uses TriggerRuleDep to evaluate trigger rules!
+    schedulable_tis, callback = dag_run.update_state(
+        session=session,
+        execute_callbacks=False,
+    )
+
+    # Airflow's native schedule_tis() marks tasks as QUEUED
+    if schedulable_tis:
+        dag_run.schedule_tis(schedulable_tis, session=session)
+
+    # Start activities for schedulable tasks
+    for ti in schedulable_tis:
+        # Sync task state to real Airflow DB BEFORE starting activity
+        await workflow.execute_activity(sync_task_status, TaskStatusSync(
+            dag_id=ti.dag_id, task_id=ti.task_id, run_id=self.run_id,
+            state=ti.state.value, start_date=workflow.now(),
+        ))
+
+        # Start task execution activity
+        handle = workflow.start_activity(run_airflow_task, ...)
+```
+
+### Comparison: Standalone vs Deep Integration
+
+| Aspect | Standalone | Deep Integration |
+|--------|------------|------------------|
+| **In-workflow database** | ✅ Yes | ✅ Yes (same design) |
+| **Uses update_state()** | ✅ Yes | ✅ Yes (same logic) |
+| **Uses TriggerRuleDep** | ✅ Yes (via update_state) | ✅ Yes (via update_state) |
+| **DAG source** | Passed in workflow input | Loaded from Airflow DB via activity |
+| **Connections/Variables** | Passed in workflow input | Read from real Airflow DB by hooks |
+| **State visibility** | Workflow state only | Synced to real Airflow DB |
+| **Airflow UI** | Not visible | Full visibility |
+
+**The only difference**: Deep integration adds sync activities to write state to the real Airflow DB,
+and loads DAG/connections from the real DB instead of workflow input.
+
+### Why Reuse Airflow's Native Logic?
+
+#### Trigger Rules in Airflow
+
+Airflow supports 13 different trigger rules that determine when a task should run:
+
+| Trigger Rule | Description |
+|--------------|-------------|
+| `all_success` | (Default) Run when all upstream tasks succeed |
+| `all_failed` | Run when all upstream tasks fail |
+| `all_done` | Run when all upstream tasks complete (any state) |
+| `all_skipped` | Run when all upstream tasks are skipped |
+| `one_success` | Run when at least one upstream succeeds |
+| `one_failed` | Run when at least one upstream fails |
+| `one_done` | Run when at least one upstream completes |
+| `none_failed` | Run when no upstream tasks failed (skipped OK) |
+| `none_failed_min_one_success` | None failed and at least one succeeded |
+| `none_skipped` | Run when no upstream tasks are skipped |
+| `always` | Run regardless of upstream state |
+| `no_trigger` | Externally triggered only |
+
+#### How the Built-in Scheduler Handles Trigger Rules
+
+The Airflow scheduler evaluates trigger rules through a dependency chain:
+
+```
+Scheduler Loop
+     │
+     ▼
+dag_run.update_state(session)
+     │
+     ▼
+TaskInstance.evaluate_dep_context()
+     │
+     ▼
+TriggerRuleDep.get_dep_statuses()
+     │
+     ├─ Counts upstream states (success, failed, skipped, etc.)
+     ├─ Applies trigger rule logic
+     └─ Returns DepStatus (met/not met)
+```
+
+The key class is `TriggerRuleDep` (located in `airflow/ti_deps/deps/trigger_rule_dep.py`).
+This class:
+1. Queries upstream task states
+2. Counts how many are in each state
+3. Applies the trigger rule logic
+4. Returns whether the dependency is met
+
+#### Why NOT Reimplement Trigger Rule Logic
+
+Reimplementing trigger rules in the Temporal workflow would be:
+
+1. **Error-prone**: 13 rules with subtle edge cases
+2. **Maintenance burden**: Must track Airflow changes
+3. **Inconsistent**: Could behave differently than Airflow scheduler
+4. **Unnecessary**: Airflow's code already handles this perfectly
+
+#### How We Reuse Airflow's Logic
+
+By using an in-workflow database with real Airflow models:
+
+```python
+# In the workflow scheduling loop:
+dag_run.update_state(session=session)  # ← This calls TriggerRuleDep internally!
+```
+
+`dag_run.update_state()` internally:
+1. Iterates through all TaskInstances
+2. Calls `ti._get_dep_statuses()` which includes `TriggerRuleDep`
+3. Returns tasks that are now schedulable
+
+**Result**: Deep integration gets identical trigger rule behavior to Airflow's built-in scheduler
+with zero custom logic required.
+
+---
+
+## Activity: create_dagrun_record
+
+Creates DagRun and TaskInstance records in Airflow database:
+
+```python
+# scripts/temporal_airflow/activities.py
 
 @dataclass
 class CreateDagRunInput:
-    """Input for creating DagRun record."""
     dag_id: str
     logical_date: datetime
     conf: dict
-    triggered_by: str = "temporal"  # For audit trail
-
 
 @dataclass
 class CreateDagRunResult:
-    """Result from creating DagRun record."""
     run_id: str
     dag_run_id: int
-
 
 @activity.defn(name="create_dagrun_record")
 async def create_dagrun_record(input: CreateDagRunInput) -> CreateDagRunResult:
@@ -432,77 +625,49 @@ async def create_dagrun_record(input: CreateDagRunInput) -> CreateDagRunResult:
     - No REST API limitations
     - Can set any state including RUNNING
     - Uses run_type='external' so scheduler ignores this run
-
-    This is the FIRST activity called by the workflow, ensuring:
-    - No orphan DagRuns if workflow fails to start
-    - Temporal owns execution from the beginning
-    - Airflow UI shows the run immediately after workflow starts
     """
-    activity.logger.info(
-        f"Creating DagRun for {input.dag_id} at {input.logical_date}"
-    )
-
     with create_session() as session:
-        # Generate run_id with 'external' prefix
         run_id = f"external__{input.logical_date.strftime('%Y-%m-%dT%H:%M:%S')}"
 
-        # Create DagRun with run_type=EXTERNAL
-        # This tells the Airflow scheduler to IGNORE this run completely
         dag_run = DagRun(
             dag_id=input.dag_id,
             run_id=run_id,
             logical_date=input.logical_date,
             conf=input.conf,
-            state=DagRunState.RUNNING,  # Can set RUNNING directly!
-            run_type=DagRunType.EXTERNAL,  # ← KEY: Scheduler ignores this
-            external_trigger=True,
+            state=DagRunState.RUNNING,
+            run_type=DagRunType.EXTERNAL,  # ← Scheduler ignores this
             start_date=datetime.utcnow(),
         )
         session.add(dag_run)
-        session.flush()  # Get the ID
+        session.flush()
 
-        # Create TaskInstance records for all tasks in the DAG
-        # (Workflow will update their states as they execute)
+        # Create TaskInstance records for all tasks
         serialized = SerializedDagModel.get(input.dag_id, session=session)
         if serialized:
-            dag = serialized.dag
-            for task in dag.tasks:
+            for task in serialized.dag.tasks:
                 ti = TaskInstance(
                     dag_id=input.dag_id,
                     task_id=task.task_id,
                     run_id=run_id,
-                    map_index=-1,
                     state=TaskInstanceState.SCHEDULED,
                 )
                 session.add(ti)
 
         session.commit()
-
-        activity.logger.info(f"Created DagRun {run_id} (type=external) with ID {dag_run.id}")
         return CreateDagRunResult(run_id=run_id, dag_run_id=dag_run.id)
 ```
 
-**Why Direct DB Access?**
+---
 
-| Aspect | REST API | Direct DB Access |
-|--------|----------|------------------|
-| Set RUNNING state | ❌ Not allowed | ✅ Full control |
-| Create TaskInstances | ❌ No endpoint | ✅ Direct insert |
-| Set run_type=external | ❌ Not exposed | ✅ Full control |
-| Decoupling | ✅ HTTP only | ⚠️ Needs airflow package |
-| Version sensitivity | ✅ API versioned | ⚠️ Must match schema |
+## Activity: sync_task_status / sync_dagrun_status
 
-### Component 3: Status Sync Activities
-
-Activities that write execution status back to Airflow DB:
+Write execution status back to Airflow DB for UI visibility:
 
 ```python
-# scripts/temporal_airflow/activities.py (additions)
-
+# scripts/temporal_airflow/activities.py
 
 @dataclass
 class TaskStatusSync:
-    """Input for syncing task status to Airflow DB."""
     dag_id: str
     task_id: str
     run_id: str
@@ -510,87 +675,46 @@ class TaskStatusSync:
     state: str
     start_date: datetime
     end_date: datetime | None
-    duration: float | None
-    try_number: int
     xcom_value: Any | None = None
-
-
-@dataclass
-class DagRunStatusSync:
-    """Input for syncing DagRun status to Airflow DB."""
-    dag_id: str
-    run_id: str
-    state: str
-    start_date: datetime
-    end_date: datetime | None
-
 
 @activity.defn(name="sync_task_status")
 async def sync_task_status(input: TaskStatusSync) -> None:
-    """
-    Write task execution status to Airflow database.
-
-    This allows the Airflow UI to display real-time task status
-    while Temporal owns the actual execution.
-    """
-    activity.logger.info(
-        f"Syncing task status: {input.dag_id}.{input.task_id} -> {input.state}"
-    )
-
+    """Write task status to Airflow database for UI visibility."""
     with create_session() as session:
         ti = session.query(TaskInstance).filter(
             TaskInstance.dag_id == input.dag_id,
             TaskInstance.task_id == input.task_id,
             TaskInstance.run_id == input.run_id,
-            TaskInstance.map_index == input.map_index,
         ).first()
 
-        if not ti:
-            # Create TaskInstance if it doesn't exist
-            # (workflow may have created tasks not yet in DB)
-            ti = TaskInstance(
-                dag_id=input.dag_id,
-                task_id=input.task_id,
-                run_id=input.run_id,
-                map_index=input.map_index,
-            )
-            session.add(ti)
+        if ti:
+            ti.state = TaskInstanceState(input.state)
+            ti.start_date = input.start_date
+            ti.end_date = input.end_date
 
-        # Update state
-        ti.state = TaskInstanceState(input.state)
-        ti.start_date = input.start_date
-        ti.end_date = input.end_date
-        ti.duration = input.duration
-        ti.try_number = input.try_number
+            if input.xcom_value is not None:
+                XCom.set(
+                    key="return_value",
+                    value=input.xcom_value,
+                    dag_id=input.dag_id,
+                    task_id=input.task_id,
+                    run_id=input.run_id,
+                    session=session,
+                )
 
-        # Store XCom if present
-        if input.xcom_value is not None:
-            from airflow.models import XCom
-            XCom.set(
-                key="return_value",
-                value=input.xcom_value,
-                dag_id=input.dag_id,
-                task_id=input.task_id,
-                run_id=input.run_id,
-                map_index=input.map_index,
-                session=session,
-            )
+            session.commit()
 
-        session.commit()
 
+@dataclass
+class DagRunStatusSync:
+    dag_id: str
+    run_id: str
+    state: str
+    end_date: datetime | None
 
 @activity.defn(name="sync_dagrun_status")
 async def sync_dagrun_status(input: DagRunStatusSync) -> None:
-    """
-    Write DagRun status to Airflow database.
-
-    Called when workflow starts and completes to keep
-    Airflow UI in sync.
-    """
-    activity.logger.info(
-        f"Syncing DagRun status: {input.dag_id}/{input.run_id} -> {input.state}"
-    )
-
+    """Write DagRun status to Airflow database."""
     with create_session() as session:
         dag_run = session.query(DagRun).filter(
             DagRun.dag_id == input.dag_id,
@@ -599,200 +723,212 @@ async def sync_dagrun_status(input: DagRunStatusSync) -> None:
 
         if dag_run:
             dag_run.state = DagRunState(input.state)
-            dag_run.start_date = input.start_date
             dag_run.end_date = input.end_date
             session.commit()
 ```
 
-### Component 4: Modified Workflow (Workflow-First Pattern)
+---
 
-The workflow creates the DagRun as its first action, then executes tasks:
+## Activity: run_airflow_task
+
+Executes actual Airflow operators:
 
 ```python
-# scripts/temporal_airflow/workflows.py (modifications)
+# scripts/temporal_airflow/activities.py
 
-@workflow.defn(name="execute_airflow_dag", sandboxed=False)
-class ExecuteAirflowDagWorkflow:
+@activity.defn(name="run_airflow_task")
+async def run_airflow_task(input: ActivityTaskInput) -> TaskExecutionResult:
+    """
+    Execute an Airflow task operator.
 
-    @workflow.run
-    async def run(self, input: DagExecutionInput) -> DagExecutionResult:
-        # ... existing initialization ...
+    Hooks read connections from Airflow DB automatically via
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN environment variable.
+    """
+    # Load DAG and extract operator
+    dag = deserialize_dag(input.serialized_dag)
+    task = dag.get_task(input.task_id)
 
-        # FIRST: Create DagRun record in Airflow DB
-        # This ensures no orphan records - if we get here, workflow started successfully
-        dagrun_result = await workflow.execute_activity(
-            create_dagrun_record,
-            CreateDagRunInput(
-                dag_id=input.dag_id,
-                logical_date=input.logical_date,
-                conf=input.conf,
-                run_type=input.run_type,
-                external_trigger=input.run_type == "manual",
-            ),
-            start_to_close_timeout=timedelta(seconds=30),
-        )
+    # Execute operator
+    result = task.execute(context=build_context(input))
 
-        # Store run_id for use in subsequent activities
-        self.run_id = dagrun_result.run_id
-
-        # ... existing scheduling loop (unchanged) ...
-
-        # On completion, sync final state
-        final_state = "success" if self.tasks_failed == 0 else "failed"
-        await self._sync_dagrun_status(final_state, self.start_date, workflow.now())
-
-        return result
-
-    async def _sync_dagrun_status(
-        self,
-        state: str,
-        start_date: datetime,
-        end_date: datetime | None,
-    ):
-        """Sync DagRun status to Airflow DB."""
-        await workflow.execute_activity(
-            sync_dagrun_status,
-            DagRunStatusSync(
-                dag_id=self.dag_id,
-                run_id=self.run_id,
-                state=state,
-                start_date=start_date,
-                end_date=end_date,
-            ),
-            start_to_close_timeout=timedelta(seconds=30),
-        )
-
-    async def _handle_activity_completion(
-        self,
-        ti_key: tuple,
-        result: TaskExecutionResult,
-    ):
-        """Handle task completion and sync to Airflow DB."""
-        dag_id, task_id, run_id, map_index = ti_key
-
-        # Update in-memory state (existing code)
-        self._update_task_instance_state(ti_key, result)
-
-        # Sync to Airflow DB for UI visibility
-        await workflow.execute_activity(
-            sync_task_status,
-            TaskStatusSync(
-                dag_id=dag_id,
-                task_id=task_id,
-                run_id=run_id,
-                map_index=map_index,
-                state=result.state,
-                start_date=result.start_date,
-                end_date=result.end_date,
-                duration=result.duration,
-                try_number=result.try_number,
-                xcom_value=result.xcom_data,
-            ),
-            start_to_close_timeout=timedelta(seconds=30),
-        )
+    return TaskExecutionResult(
+        state="success",
+        xcom_data=result,
+        end_date=datetime.utcnow(),
+    )
 ```
 
-### Component 5: Extended API (Direct Workflow Trigger)
+**Key insight**: No changes needed for connections/variables - hooks already read from Airflow DB.
 
-API starts workflow directly - workflow creates DagRun record:
+---
+
+## Trigger Service
+
+Evaluates DAG schedules and starts Temporal workflows (only needed with minimal approach):
 
 ```python
-# airflow-core/src/airflow/api_fastapi/core_api/routes/dag_run.py (modifications)
+# scripts/temporal_airflow/trigger_service.py
 
-@router.post("/dags/{dag_id}/dagRuns")
-async def trigger_dag_run(
-    dag_id: str,
-    body: TriggerDAGRunPostBody,
-    session: Session = Depends(get_session),
-):
+class TemporalScheduleTrigger:
     """
-    Trigger a new DAG run via Temporal workflow.
+    Evaluates DAG schedules and starts Temporal workflows.
 
-    Key design: We do NOT create DagRun in database here.
-    The workflow's first activity creates the record, ensuring:
-    - No orphan DagRuns if workflow fails to start
-    - Temporal owns execution from the beginning
+    Only needed when NOT using the pluggable orchestrator approach.
+    With TemporalOrchestrator, this service is unnecessary.
     """
-    # Validate DAG exists
-    dag_model = session.query(DagModel).filter(DagModel.dag_id == dag_id).first()
-    if not dag_model:
-        raise HTTPException(status_code=404, detail=f"DAG {dag_id} not found")
 
-    # Get serialized DAG
-    serialized = SerializedDagModel.get(dag_id)
-    if not serialized:
-        raise HTTPException(status_code=404, detail=f"Serialized DAG {dag_id} not found")
+    async def _run_loop(self):
+        while self.running:
+            await self._process_due_schedules()
+            await asyncio.sleep(1)
 
-    logical_date = body.logical_date or utcnow()
+    async def _process_due_schedules(self):
+        with create_session() as session:
+            active_dags = session.query(SerializedDagModel).filter(
+                SerializedDagModel.is_active == True,
+            ).all()
 
-    # Start Temporal workflow - workflow will create DagRun record
-    try:
-        temporal_client = await get_temporal_client()
+            for dag_model in active_dags:
+                if self._is_due(dag_model):
+                    await self._start_workflow(dag_model)
 
-        # Workflow ID uses logical_date for idempotency
-        workflow_id = f"airflow-{dag_id}-{logical_date.isoformat()}"
+    async def _start_workflow(self, dag_model, logical_date):
+        workflow_id = f"airflow-{dag_model.dag_id}-{logical_date.isoformat()}"
 
-        handle = await temporal_client.start_workflow(
+        await self.temporal_client.start_workflow(
             ExecuteAirflowDagWorkflow.run,
             DagExecutionInput(
-                dag_id=dag_id,
+                dag_id=dag_model.dag_id,
                 logical_date=logical_date,
-                serialized_dag=serialized.data,
-                conf=body.conf or {},
-                run_type="manual",
-                # run_id will be generated by create_dagrun_record activity
+                serialized_dag=dag_model.data,
             ),
             id=workflow_id,
             task_queue=conf.get("temporal", "task_queue"),
         )
-
-        # Return workflow info - DagRun record will be created by workflow
-        return {
-            "workflow_id": workflow_id,
-            "dag_id": dag_id,
-            "logical_date": logical_date,
-            "message": "Workflow started. DagRun will appear in UI shortly.",
-        }
-
-    except WorkflowAlreadyStartedError:
-        raise HTTPException(
-            status_code=409,
-            detail=f"DAG run for {dag_id} at {logical_date} already exists"
-        )
-    except Exception as e:
-        log.exception(f"Failed to start Temporal workflow: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 ```
 
-### Component 6: Connection Access (No Changes Needed!)
+---
 
-**Key insight**: Airflow hooks already read from the database. Workers just need the database connection configured:
+## Data Flow
 
-```python
-# This already works - no code changes needed!
+### Flow 1: User Triggers DAG Run (Deep Integration)
 
-# In any operator
-from airflow.hooks.base import BaseHook
-conn = BaseHook.get_connection("my_postgres_conn")
-# ^ This reads from Airflow DB using AIRFLOW__DATABASE__SQL_ALCHEMY_CONN
-
-# Variables work the same way
-from airflow.models import Variable
-api_key = Variable.get("my_api_key")
-# ^ This reads from Airflow DB
+```
+1. User clicks "Trigger DAG" in Airflow UI
+                    │
+                    ▼
+2. API/Orchestrator starts Temporal workflow
+   - Passes dag_id, conf, logical_date, run_id (if exists)
+   - Workflow ID = "airflow-{dag_id}-{run_id}"
+                    │
+                    ▼
+3. Workflow initializes IN-WORKFLOW DATABASE
+   - Creates in-memory SQLite with Airflow schema
+   - Same pattern as standalone workflow
+                    │
+                    ▼
+4. Activity: load_serialized_dag
+   - Loads DAG from SerializedDagModel in real Airflow DB
+   - Returns serialized dict + fileloc
+                    │
+                    ▼
+5. Activity: create_dagrun_record (if needed)
+   - Creates DagRun in REAL Airflow DB with run_type=EXTERNAL
+   - Returns run_id for syncing
+                    │
+                    ▼
+6. Workflow creates DagRun in IN-WORKFLOW DB
+   - Uses Airflow's DagRun model directly
+   - verify_integrity() creates TaskInstances
+   - This enables Airflow's native scheduling logic
+                    │
+                    ▼
+7. SCHEDULING LOOP (using Airflow's native logic)
+   ┌─────────────────────────────────────────────────┐
+   │ dag_run.update_state(session)                   │
+   │    ├─ Evaluates TriggerRuleDep for each task    │
+   │    └─ Returns schedulable_tis                   │
+   │                                                 │
+   │ dag_run.schedule_tis(schedulable_tis)          │
+   │    └─ Marks tasks as QUEUED in in-workflow DB   │
+   │                                                 │
+   │ For each schedulable task:                      │
+   │    ├─ sync_task_status activity → Real DB       │
+   │    └─ run_airflow_task activity → Execute       │
+   │                                                 │
+   │ On task completion:                             │
+   │    ├─ Update in-workflow DB                     │
+   │    └─ sync_task_status activity → Real DB       │
+   └─────────────────────────────────────────────────┘
+                    │
+                    ▼
+8. Workflow completes
+   - sync_dagrun_status activity → Real DB
+   - Airflow UI shows SUCCESS/FAILED
 ```
 
-Worker environment configuration:
-```bash
-# Workers need database access for connections/variables
-export AIRFLOW__DATABASE__SQL_ALCHEMY_CONN="postgresql://user:pass@host/airflow"
+### Flow 2: Scheduling Logic (In-Workflow Database)
 
-# And Temporal connection
-export TEMPORAL_ADDRESS="localhost:7233"
-export TEMPORAL_TASK_QUEUE="airflow-tasks"
+```
+┌───────────────────────────────────────────────────────────────┐
+│  IN-WORKFLOW DATABASE (SQLite in-memory)                       │
+│                                                                │
+│  ┌─────────────────┐     ┌──────────────────────────────────┐ │
+│  │    DagRun       │     │        TaskInstances              │ │
+│  │  state=RUNNING  │     │  task_a: SUCCESS                  │ │
+│  │                 │     │  task_b: SUCCESS                  │ │
+│  │                 │     │  task_c: NONE (waiting)           │ │
+│  └─────────────────┘     └──────────────────────────────────┘ │
+│                                     │                          │
+│  dag_run.update_state(session)      │                          │
+│           │                         │                          │
+│           ▼                         ▼                          │
+│  ┌──────────────────────────────────────────────────────────┐ │
+│  │  TriggerRuleDep.get_dep_statuses() for task_c            │ │
+│  │                                                          │ │
+│  │  task_c.trigger_rule = "all_success"                     │ │
+│  │  upstream = [task_a, task_b]                             │ │
+│  │  upstream_states = {SUCCESS: 2, FAILED: 0}               │ │
+│  │                                                          │ │
+│  │  RESULT: Dependencies MET → task_c is schedulable!       │ │
+│  └──────────────────────────────────────────────────────────┘ │
+└───────────────────────────────────────────────────────────────┘
+                              │
+                              │ sync_task_status activity
+                              ▼
+┌───────────────────────────────────────────────────────────────┐
+│  REAL AIRFLOW DATABASE (PostgreSQL/MySQL)                      │
+│                                                                │
+│  TaskInstance for task_c: state = QUEUED (synced for UI)       │
+└───────────────────────────────────────────────────────────────┘
+```
 
-# Start worker
-python scripts/temporal_airflow/worker.py
+### Flow 3: Task Execution with Connections
+
+```
+Workflow starts run_airflow_task activity
+                    │
+                    ▼
+Activity loads DAG from file (using dag_fileloc)
+                    │
+                    ▼
+Operator executes, hook needs connection
+                    │
+                    ▼
+Hook calls BaseHook.get_connection("my_conn")
+                    │
+                    ▼
+Airflow's connection lookup reads from REAL DB
+   (standard path, zero changes needed!)
+                    │
+                    ▼
+Operator completes, activity returns result
+                    │
+                    ▼
+Workflow updates IN-WORKFLOW DB
+                    │
+                    ▼
+Workflow calls sync_task_status activity → REAL DB
 ```
 
 ---
@@ -804,67 +940,60 @@ python scripts/temporal_airflow/worker.py
 ```ini
 # airflow.cfg
 
+[core]
+# For orchestrator approach (recommended)
+orchestrator = TemporalOrchestrator
+
 [temporal]
-# Enable Temporal integration
 enabled = True
-
-# Temporal server address
 host = localhost:7233
-
-# Temporal namespace
 namespace = default
-
-# Task queue for Airflow workflows
 task_queue = airflow-tasks
-
-# Directly trigger workflows from API (vs waiting for trigger service)
-direct_trigger = True
 
 # For Temporal Cloud:
 # host = my-namespace.tmprl.cloud:7233
 # api_key = <your-api-key>
-# tls_enabled = True
 ```
 
-### Environment Variables
+### Worker Environment Variables
 
 ```bash
-# Temporal configuration (SDK envconfig)
+# Temporal configuration
 export TEMPORAL_ADDRESS=localhost:7233
 export TEMPORAL_NAMESPACE=default
 export TEMPORAL_TASK_QUEUE=airflow-tasks
-
-# For Temporal Cloud
-export TEMPORAL_ADDRESS=my-namespace.tmprl.cloud:7233
-export TEMPORAL_API_KEY=your-api-key
 
 # Airflow database (for connections/variables)
 export AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql://user:pass@host/airflow
 
 # DAGs folder
 export AIRFLOW__CORE__DAGS_FOLDER=/opt/airflow/dags
+
+# Start worker
+python scripts/temporal_airflow/worker.py
 ```
 
 ---
 
 ## Deployment Architecture
 
-### Option A: Minimal Changes (Trigger Service)
+### With Orchestrator Extension (Recommended)
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│ Airflow         │     │ Airflow         │     │ Temporal        │
-│ Webserver       │     │ Scheduler       │     │ Trigger Service │
-│ (unchanged)     │     │ (unchanged)     │     │ (new)           │
-└────────┬────────┘     └────────┬────────┘     └────────┬────────┘
-         │                       │                       │
-         │ read                  │ write DagRuns         │ start workflows
-         ▼                       ▼                       ▼
+┌─────────────────┐     ┌─────────────────┐
+│ Airflow         │     │ Airflow         │
+│ Webserver       │     │ Scheduler       │
+│ (unchanged)     │     │ (DAG parsing)   │
+└────────┬────────┘     └────────┬────────┘
+         │                       │
+         │ UI triggers →         │ schedules trigger →
+         │ orchestrator          │ orchestrator
+         ▼                       ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                        Airflow Database                          │
+│  Orchestrator: TemporalOrchestrator                              │
+│  → Starts Temporal workflow for each DagRun                      │
 └─────────────────────────────────────────────────────────────────┘
                                  │
-                                 │ read config, write status
                                  ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Temporal Server                           │
@@ -872,34 +1001,114 @@ export AIRFLOW__CORE__DAGS_FOLDER=/opt/airflow/dags
                                  │
                                  ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                        Temporal Workers                          │
+│  Temporal Workers                                                │
 │  • ExecuteAirflowDagWorkflow                                     │
-│  • run_airflow_task, sync_task_status, sync_dagrun_status        │
+│  • Activities: create_dagrun, run_task, sync_status              │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Option B: Direct API Integration
+### With Minimal Approach + Trigger Service
 
 ```
-┌─────────────────┐     ┌─────────────────┐
-│ Airflow         │     │ Airflow         │
-│ Webserver       │     │ Scheduler       │
-│ (unchanged)     │     │ (unchanged)     │
-└────────┬────────┘     └────────┬────────┘
-         │                       │
-         │ API triggers          │ scheduled runs create
-         │ start workflow        │ DagRuns, trigger service
-         │ directly              │ starts workflows
-         ▼                       ▼
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│ Airflow         │     │ Airflow         │     │ Temporal        │
+│ Webserver       │     │ Scheduler       │     │ Trigger Service │
+│ (unchanged)     │     │ (DAG parsing)   │     │ (NEW component) │
+└────────┬────────┘     └────────┬────────┘     └────────┬────────┘
+         │                       │                       │
+         │                       │                       │ polls for
+         │                       │                       │ due schedules
+         ▼                       ▼                       ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Airflow Database                          │
-│                              +                                   │
-│                   Temporal Trigger Service                       │
 └─────────────────────────────────────────────────────────────────┘
                                  │
                                  ▼
-                    (Same as Option A below)
+                    (Same Temporal stack below)
 ```
+
+---
+
+## Implementation Phases
+
+### Phase 0: Airflow Core Changes (PR to Airflow)
+
+| Change | Effort | Lines |
+|--------|--------|-------|
+| Add `DagRunType.EXTERNAL` | Tiny | ~3 |
+| Add scheduler filter | Tiny | ~4 |
+| `BaseDagRunOrchestrator` interface | Small | ~40 |
+| `orchestrator_loader.py` | Small | ~20 |
+| **Total** | **Small** | **~70** |
+
+### Phase 1: Deep Workflow Foundation
+
+Create `ExecuteAirflowDagDeepWorkflow` following standalone pattern:
+
+| Component | Description | Effort |
+|-----------|-------------|--------|
+| In-workflow database | SQLite in-memory with Airflow models | Copy from standalone |
+| `_initialize_database()` | Create workflow-specific DB | Copy from standalone |
+| `_create_local_dag_run()` | Create DagRun in in-workflow DB | Copy from standalone |
+| Reuse `update_state()` | Airflow's native trigger rule evaluation | No custom code |
+| Reuse `schedule_tis()` | Airflow's native task scheduling | No custom code |
+
+### Phase 2: Sync Activities
+
+Activities to sync in-workflow state to real Airflow DB:
+
+| Activity | Description | Effort |
+|----------|-------------|--------|
+| `load_serialized_dag` | Load DAG from SerializedDagModel | Small |
+| `create_dagrun_record` | Create DagRun in real Airflow DB | Small |
+| `ensure_task_instances` | Create TaskInstance records in real DB | Small |
+| `sync_task_status` | Sync TaskInstance state to real DB | Small |
+| `sync_dagrun_status` | Sync DagRun state to real DB | Small |
+
+### Phase 3: Integration with Orchestrator
+
+| Component | Description | Effort |
+|-----------|-------------|--------|
+| `TemporalOrchestrator` | Routes DagRun creation to Temporal workflow | Small |
+| Input model | `DeepDagExecutionInput` (dag_id, run_id, logical_date, conf) | Small |
+| Worker configuration | Support Airflow DB connection | Small |
+
+### Phase 4: Feature Parity
+
+| Feature | How Handled | Effort |
+|---------|-------------|--------|
+| Trigger rules | Via `update_state()` → TriggerRuleDep | ✅ Already works |
+| XCom | Store in workflow state + sync to real DB | Small |
+| Pools | Read limits from real DB, enforce in workflow | Medium |
+| Task retries | Temporal retry policy | Small |
+
+### Design Principle: Maximize Code Reuse
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│  Standalone Workflow (workflows.py)                             │
+│  ├── _initialize_database()                                    │
+│  ├── _create_dag_run()                                         │
+│  ├── _scheduling_loop()                                        │
+│  │      └── dag_run.update_state() ← Airflow's native logic    │
+│  └── _handle_activity_result()                                 │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              │ Copy/share these methods
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│  Deep Workflow (deep_workflow.py)                               │
+│  ├── _initialize_database()     (same as standalone)           │
+│  ├── _create_local_dag_run()    (same as standalone)           │
+│  ├── _scheduling_loop()         (same + sync activities)       │
+│  │      └── dag_run.update_state() ← Same native logic!        │
+│  ├── _handle_activity_result()  (same + sync activities)       │
+│  └── NEW: Sync activities to write to real Airflow DB          │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**Key insight**: The deep workflow should look almost identical to standalone,
+just with sync activities added at key state transition points.
 
 ---
 
@@ -914,7 +1123,6 @@ export AIRFLOW__CORE__DAGS_FOLDER=/opt/airflow/dags
 | **Better reliability** | Temporal's durability guarantees |
 | **Simpler workers** | No Celery/Redis/Flower complexity |
 | **Better debugging** | Temporal UI shows complete workflow history |
-| **Gradual migration** | Can run both modes side by side |
 
 ### Technical Benefits
 
@@ -923,7 +1131,6 @@ export AIRFLOW__CORE__DAGS_FOLDER=/opt/airflow/dags
 | **Durable execution** | Workflows survive worker crashes |
 | **Built-in retries** | Temporal handles retry logic |
 | **Activity timeouts** | Per-task timeout enforcement |
-| **Workflow replay** | Debug by replaying execution |
 | **No DB contention** | Execution doesn't poll database |
 | **Horizontal scaling** | Add workers without coordination |
 
@@ -931,245 +1138,244 @@ export AIRFLOW__CORE__DAGS_FOLDER=/opt/airflow/dags
 
 ## Challenges and Mitigations
 
-### Challenge 1: Two Sources of Truth
-
-**Issue**: Temporal owns execution state, Airflow DB shows status (eventual consistency)
-
-**Mitigation**:
-- Sync activities called immediately after state changes
-- Temporal is authoritative for "what's running"
-- Airflow DB is authoritative for "what happened" (audit)
-
-### Challenge 2: Worker Configuration
-
-**Issue**: Workers need both Temporal and Airflow DB access
-
-**Mitigation**:
-- Single environment configuration
-- Same database connection as traditional Airflow
-- Add Temporal connection (just host:port)
-
-### Challenge 3: Scheduler Still Needed
-
-**Issue**: DAG parsing and schedule management still require scheduler
-
-**Mitigation**:
-- Scheduler scope reduced (no task scheduling)
-- Could eventually use Temporal Schedules for cron
-- DAG parsing could move to workers (future)
-
-### Challenge 4: Pool Support
-
-**Issue**: Pools limit concurrent tasks, currently DB-enforced
-
-**Mitigation**:
-- Workflow reads pool limits from DB
-- Implements slot counting in workflow state
-- Activity acquires/releases slots
-
-### Challenge 5: Dataset/Sensor Integration
-
-**Issue**: Dataset triggers and sensors rely on DB polling
-
-**Mitigation**:
-- Dataset: Could use Temporal signals when datasets update
-- Sensors: Run as activities with heartbeat
-- Long-term: Native Temporal patterns for waiting
-
----
-
-## Implementation Phases
-
-### Airflow Changes (PR to Airflow)
-
-| Phase | Work | Effort | Files |
-|-------|------|--------|-------|
-| **Phase 0** | Add `DagRunType.EXTERNAL` + scheduler filter | Tiny (~7 lines) | `types.py`, `dagrun.py` |
-
-### External Implementation (No Airflow Changes)
-
-| Phase | Work | Effort | Dependencies |
-|-------|------|--------|--------------|
-| **Phase 1** | Add create_dagrun_record activity with direct DB access | Small | Phase 0 |
-| **Phase 2** | Add sync activities (sync_task_status, sync_dagrun_status) | Small | Phase 1 |
-| **Phase 3** | Modify workflow to call create_dagrun first, then sync activities | Small | Phase 2 |
-| **Phase 4** | Create Temporal Schedule Trigger Service | Medium | Phase 3 |
-| **Phase 5** | Extend Airflow API for direct workflow trigger (optional) | Small | Phase 3 |
-| **Phase 6** | Add Airflow configuration section | Small | Phase 4 |
-| **Phase 7** | Pool support (read limits, enforce in workflow) | Medium | Phase 4 |
-| **Phase 8** | Documentation and migration guide | Medium | Phase 6 |
-| **Phase 9** | Dataset trigger integration | Large | Phase 8 |
-| **Phase 10** | Sensor as durable activity pattern | Large | Phase 8 |
-
-### Future (HTTP API Approach)
-
-| Phase | Work | Effort | Dependencies |
-|-------|------|--------|--------------|
-| **Future 1** | REST API changes to allow RUNNING state | Medium (~70 lines) | Airflow acceptance |
-| **Future 2** | Migrate activities from direct DB to HTTP calls | Medium | Future 1 |
+| Challenge | Mitigation |
+|-----------|------------|
+| **Two sources of truth** | Sync activities called immediately; Temporal authoritative for running state |
+| **Worker configuration** | Single environment config; same DB connection as traditional Airflow |
+| **Scheduler still needed** | Reduced scope (DAG parsing only); could use Temporal Schedules for cron |
+| **Pool support** | Workflow reads limits from DB, enforces in workflow state |
+| **Dataset/Sensor integration** | Could use Temporal signals; sensors run as activities with heartbeat |
 
 ---
 
 ## Migration Path
 
-### From Traditional Airflow to Deep Integration
-
-**Step 1: Deploy Temporal Infrastructure**
-- Start Temporal server (or use Temporal Cloud)
-- Deploy Temporal workers with Airflow activities
-
-**Step 2: Enable Trigger Service**
-- Deploy Temporal Trigger Service
-- Configure to watch specific DAGs (gradual rollout)
-
-**Step 3: Migrate DAGs Gradually**
-- Tag DAGs for Temporal execution
-- Trigger service only processes tagged DAGs
-- Monitor in both Airflow UI and Temporal UI
-
-**Step 4: Validate and Expand**
-- Verify task states sync correctly
-- Verify connections/variables work
-- Expand to more DAGs
-
-**Step 5: Full Migration**
-- All DAGs on Temporal
-- Disable traditional executor
-- Keep scheduler for DAG parsing only
+1. **Deploy Temporal Infrastructure** - Start Temporal server or use Temporal Cloud
+2. **Deploy Temporal Workers** - With Airflow activities
+3. **Enable for specific DAGs** - Gradual rollout with tagging
+4. **Validate** - Verify status sync, connections work
+5. **Full migration** - All DAGs on Temporal, disable traditional executor
 
 ---
 
-## Comparison: Standalone vs Deep Integration
+## Appendix: Executor Pattern Background
 
-| Aspect | Standalone Mode | Deep Integration |
-|--------|-----------------|------------------|
-| **UI** | Temporal UI only | Airflow UI (unchanged) |
-| **Database** | None (or optional) | Required (config + status) |
-| **Scheduler** | Not needed | Required (DAG parsing) |
-| **Connections** | Passed at submit time | Read from Airflow DB |
-| **Variables** | Passed at submit time | Read from Airflow DB |
-| **Triggering** | CLI/API script | Airflow UI/API/Schedule |
-| **Status visibility** | Temporal UI | Airflow UI |
-| **Migration effort** | New deployment | Incremental |
-| **Use case** | New projects, simple needs | Existing Airflow deployments |
+Traditional Airflow executors use a **pull-based event buffer pattern**:
+
+```python
+class BaseExecutor:
+    def __init__(self):
+        self.event_buffer: dict[TaskInstanceKey, tuple[state, info]] = {}
+
+    def sync(self) -> None:
+        """Called by scheduler to poll workers."""
+        pass
+
+    def success(self, key: TaskInstanceKey):
+        """Store success in buffer (doesn't write to DB)."""
+        self.event_buffer[key] = (TaskInstanceState.SUCCESS, info)
+```
+
+The scheduler processes events and writes to DB. For `DagRunType.EXTERNAL` runs, the scheduler is bypassed entirely, so Temporal activities can write directly to the database.
 
 ---
 
-## Future Consideration: HTTP API Approach
+## Appendix: Executor Delegation (Future)
 
-While the direct database access approach is recommended for initial implementation, a fully HTTP-based approach could provide better decoupling in the future. This section documents what Airflow REST API changes would be needed.
+For gradual migration, Temporal activities can delegate task execution to existing Airflow executors (Celery, Kubernetes, Local), allowing teams to reuse existing worker infrastructure while Temporal handles DAG orchestration.
+
+### Why Delegate to Executors?
+
+| Scenario | Benefit |
+|----------|---------|
+| **Existing Celery cluster** | Reuse workers, queues, routing rules |
+| **Kubernetes executor** | Reuse pod templates, resource configs |
+| **Gradual migration** | Change orchestration without changing execution |
+| **Specialized workers** | Keep task-specific worker pools |
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Temporal Worker                                                 │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  ExecutorActivityManager                                   │  │
+│  │  ├─ Shared executor instance (Celery/K8s/Local)           │  │
+│  │  ├─ Background sync loop (polls executor)                 │  │
+│  │  └─ Pending futures (routes completions to activities)    │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                              │                                   │
+│                              │ queue_command()                   │
+│                              ▼                                   │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  Airflow Executor (CeleryExecutor, KubernetesExecutor)    │  │
+│  └───────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Existing Infrastructure                                         │
+│  • Celery workers + Redis/RabbitMQ broker                       │
+│  • Kubernetes pods                                              │
+│  • Local subprocess pool                                        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Implementation Pattern
+
+The key challenge is that executors use a **poll-based async pattern** (scheduler calls `sync()` and reads `event_buffer`), while activities want to block until completion. Solution: shared executor with background sync loop that routes completions to waiting activities via futures.
+
+```python
+class ExecutorActivityManager:
+    """Manages shared Airflow executor for Temporal activities."""
+
+    def __init__(self, executor_type: str | None = None):
+        self.executor_type = executor_type
+        self._executor = None
+        self._pending: dict[TaskInstanceKey, asyncio.Future] = {}
+        self._lock = asyncio.Lock()
+        self._job: Job | None = None
+
+    def start(self):
+        """Initialize executor (call once at worker startup)."""
+        # Load configured executor
+        if self.executor_type:
+            self._executor = ExecutorLoader.load_executor(self.executor_type)
+        else:
+            self._executor = ExecutorLoader.get_default_executor()
+
+        # Create real job record for visibility in Airflow
+        with create_session() as session:
+            self._job = Job(
+                job_type="TemporalWorker",
+                state=JobState.RUNNING,
+                hostname=socket.getfqdn(),
+            )
+            session.add(self._job)
+            session.commit()
+            self._executor.job_id = self._job.id
+
+        self._executor.start()
+
+        # Start background loops
+        self._sync_task = asyncio.create_task(self._sync_loop())
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+    async def _sync_loop(self):
+        """Background loop polling executor for completions."""
+        while True:
+            async with self._lock:
+                self._executor.sync()
+                events = self._executor.get_event_buffer()
+
+                # Route completions to waiting activities
+                for key, (state, info) in events.items():
+                    if key in self._pending:
+                        self._pending[key].set_result((state, info))
+                        del self._pending[key]
+
+            await asyncio.sleep(0.5)
+
+    async def _heartbeat_loop(self):
+        """Update job heartbeat so Airflow knows worker is alive."""
+        while True:
+            with create_session() as session:
+                job = session.query(Job).get(self._job.id)
+                if job:
+                    job.latest_heartbeat = timezone.utcnow()
+                    session.commit()
+            await asyncio.sleep(30)
+
+    @activity.defn(name="run_task_via_executor")
+    async def run_task(self, input: ActivityTaskInput) -> TaskExecutionResult:
+        """Execute task via configured executor, wait for completion."""
+        key = TaskInstanceKey(
+            dag_id=input.dag_id,
+            task_id=input.task_id,
+            run_id=input.run_id,
+            try_number=input.try_number,
+            map_index=input.map_index,
+        )
+
+        command = ["airflow", "tasks", "run", input.dag_id, input.task_id,
+                   input.logical_date.isoformat(), "--local", "--raw"]
+
+        # Create future for completion notification
+        future = asyncio.get_event_loop().create_future()
+
+        async with self._lock:
+            self._pending[key] = future
+            self._executor.queue_command(key, command, priority=1, queue=input.queue)
+
+        # Wait for sync loop to resolve our future
+        while not future.done():
+            await asyncio.sleep(2)
+            activity.heartbeat()
+
+        state, info = future.result()
+        return TaskExecutionResult(state=state.value, info=info)
+```
+
+### Executor Compatibility
+
+| Executor | Compatibility | Notes |
+|----------|---------------|-------|
+| **LocalExecutor** | ✅ Full | Subprocess pool, works seamlessly |
+| **CeleryExecutor** | ✅ Full | Submits to existing Celery workers |
+| **KubernetesExecutor** | ✅ Full | Creates pods via K8s API |
+| **SequentialExecutor** | ✅ Full | Synchronous, trivial |
+| **Custom executors** | ⚠️ Varies | Depends on implementation |
+
+### Benefits
+
+| Benefit | Description |
+|---------|-------------|
+| **Zero worker changes** | Existing Celery/K8s workers unchanged |
+| **Reuse infrastructure** | Keep existing queues, routing, pod templates |
+| **Visibility** | Temporal workers appear in Airflow job table |
+| **Gradual migration** | Change orchestration layer without disruption |
+
+### When to Use
+
+- **Use executor delegation** when you have significant investment in executor infrastructure (Celery routing rules, K8s pod templates, specialized worker pools)
+- **Use direct execution** (default) for simpler deployments or when you want Temporal to fully own the execution environment
+
+---
+
+## Appendix: HTTP API Approach (Future)
+
+While direct DB access is recommended for initial implementation, an HTTP-based approach could provide better decoupling.
 
 ### Current REST API Limitations
 
 | Operation | Status | Limitation |
 |-----------|--------|------------|
 | Create DagRun | ✅ Works | Cannot set `run_type=external` |
-| Set DagRun → RUNNING | ❌ Blocked | `DAGRunPatchStates` enum excludes RUNNING |
-| Set TaskInstance → RUNNING | ❌ Blocked | `validate_new_state()` excludes RUNNING |
+| Set DagRun → RUNNING | ❌ Blocked | Enum excludes RUNNING |
 | Create TaskInstance | ❌ No endpoint | Endpoint doesn't exist |
 
-### Required Airflow REST API Changes (~70 lines)
+### Required Changes (~70 lines)
 
-#### 1. Allow `run_type` in POST /dagRuns
+1. Allow `run_type` in POST /dagRuns
+2. Allow RUNNING in PATCH /dagRuns
+3. Allow RUNNING/SCHEDULED in PATCH /taskInstances
+4. Add POST /taskInstances endpoint
 
-```python
-# airflow/api_fastapi/core_api/datamodels/dag_run.py
-
-class TriggerDAGRunPostBody(StrictBaseModel):
-    # ... existing fields ...
-    run_type: DagRunType | None = None  # ← ADD: Allow specifying EXTERNAL
-```
-
-#### 2. Allow RUNNING in PATCH /dagRuns
-
-```python
-# airflow/api_fastapi/core_api/datamodels/dag_run.py
-
-class DAGRunPatchStates(str, Enum):
-    QUEUED = DagRunState.QUEUED
-    SUCCESS = DagRunState.SUCCESS
-    FAILED = DagRunState.FAILED
-    RUNNING = DagRunState.RUNNING  # ← ADD
-```
-
-Plus handler logic in `patch_dag_run()` to call `set_dag_run_state_to_running()`.
-
-#### 3. Allow RUNNING/SCHEDULED in PATCH /taskInstances
-
-```python
-# airflow/api_fastapi/core_api/datamodels/task_instances.py
-
-@field_validator("new_state", mode="before")
-def validate_new_state(cls, ns):
-    valid_states = [
-        vs.name.lower() for vs in (
-            TaskInstanceState.SUCCESS,
-            TaskInstanceState.FAILED,
-            TaskInstanceState.SKIPPED,
-            TaskInstanceState.RUNNING,    # ← ADD
-            TaskInstanceState.SCHEDULED,  # ← ADD
-        )
-    ]
-```
-
-#### 4. Add POST /taskInstances Endpoint (~50 lines)
-
-```python
-# airflow/api_fastapi/core_api/routes/public/task_instances.py
-
-@task_instances_router.post(
-    "/dags/{dag_id}/dagRuns/{dag_run_id}/taskInstances",
-)
-async def create_task_instance(
-    dag_id: str,
-    dag_run_id: str,
-    body: CreateTaskInstanceBody,
-):
-    """Create TaskInstance for externally managed DagRun."""
-    # Verify DagRun exists and is EXTERNAL type
-    # Create TaskInstance record
-    pass
-```
-
-### HTTP Approach: Benefits and Tradeoffs
-
-| Aspect | Direct DB | HTTP API |
-|--------|-----------|----------|
-| **Decoupling** | Tight (needs airflow package) | Loose (HTTP only) |
-| **Version sensitivity** | Must match DB schema | API versioned |
-| **Deployment** | Same Python environment | Any language/platform |
-| **Performance** | Fast (direct DB) | Slower (HTTP overhead) |
-| **Airflow changes** | ~7 lines | ~70 lines |
-| **Implementation effort** | Lower | Higher |
-
-### Recommendation
-
-**Start with Direct DB Access** for these reasons:
-1. Minimal Airflow changes (~7 lines vs ~70 lines)
-2. Full control over all states and records
-3. Faster implementation
-4. Can migrate to HTTP later if decoupling becomes important
-
-**Consider HTTP API** when:
-- Running Temporal workers in a different environment than Airflow
-- Need language-agnostic integration
-- Want stronger API contract guarantees
-- Airflow team accepts the REST API changes upstream
+**Recommendation**: Start with direct DB access, consider HTTP API when decoupling becomes important.
 
 ---
 
 ## Conclusion
 
-Deep Integration mode provides the best of both worlds:
+Deep Integration provides the best of both worlds:
 - **User experience**: Familiar Airflow UI and workflows
 - **Execution reliability**: Temporal's proven durability
 - **Operational simplicity**: Remove Celery/Redis/Kubernetes executor complexity
-- **Gradual adoption**: Migrate DAGs incrementally
+
+**Implementation options**:
+1. **Minimal approach** (~7 lines Airflow) + Trigger Service
+2. **Orchestrator extension** (~140 lines Airflow) - cleaner, works with existing UI/API/CLI
 
 The key architectural insight is separating concerns:
 - **Airflow**: User interface, configuration storage, status display
 - **Temporal**: Execution engine, durability, retry management
-
-**Implementation approach**: Direct database access with `run_type='external'` requires only ~7 lines of Airflow changes, while HTTP API approach (~70 lines) is documented for future consideration.
-
-This separation allows teams to leverage Temporal's superior execution guarantees while maintaining the Airflow experience their users expect.
