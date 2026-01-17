@@ -43,11 +43,12 @@ RUN cp -r /tmp/airflow/shared /opt/airflow/shared && \
     chown -R airflow:0 /opt/airflow
 
 # Copy pre-built UI assets from official Airflow image (avoids memory-intensive npm build)
-COPY --from=apache/airflow:3.0.0 \
+# Using 3.1.6 for better API compatibility with 3.2.0-dev fork
+COPY --from=apache/airflow:3.1.6 \
     /home/airflow/.local/lib/python3.12/site-packages/airflow/ui/dist \
     /opt/airflow/airflow-core/src/airflow/ui/dist
 
-COPY --from=apache/airflow:3.0.0 \
+COPY --from=apache/airflow:3.1.6 \
     /home/airflow/.local/lib/python3.12/site-packages/airflow/api_fastapi/auth/managers/simple/ui/dist \
     /opt/airflow/airflow-core/src/airflow/api_fastapi/auth/managers/simple/ui/dist
 
