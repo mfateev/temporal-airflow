@@ -17,7 +17,7 @@ with workflow.unsafe.imports_passed_through():
     from airflow.models.taskinstance import TaskInstance, TaskInstanceState
     from airflow.models.trigger import Trigger  # Required for TaskInstance foreign key
     from airflow.models.tasklog import LogTemplate  # Required for DagRun foreign key
-    from airflow.serialization.serialized_objects import SerializedDAG
+    from airflow.serialization.serialized_objects import DagSerialization
     from airflow._shared.timezones import timezone as airflow_timezone
     from airflow.utils.time_provider import set_time_provider, clear_time_provider
     from sqlalchemy import create_engine
@@ -154,6 +154,18 @@ class ExecuteAirflowDagDeepWorkflow:
             table.drop(self.engine, checkfirst=True)
         for table in required_tables:
             table.create(self.engine, checkfirst=True)
+
+        # Create a LogTemplate record - DagRun has a non-nullable FK to it
+        session = self.sessionFactory()
+        try:
+            log_template = LogTemplate(
+                filename="{{ ti.dag_id }}/{{ ti.task_id }}/{{ ts }}/{{ try_number }}.log",
+                elasticsearch_id="{{ dag_id }}-{{ task_id }}-{{ run_id }}-{{ map_index }}-{{ try_number }}",
+            )
+            session.add(log_template)
+            session.commit()
+        finally:
+            session.close()
 
         workflow.logger.info(f"Database initialized for workflow {workflow_id} (run_id={run_id})")
 
@@ -300,7 +312,7 @@ class ExecuteAirflowDagDeepWorkflow:
             )
             # Note: from_dict() is fast (<1ms) when imports are pre-warmed
             # See deep_worker.py _prewarm_imports() which warms up deserialization
-            self.dag = SerializedDAG.from_dict(dag_result.dag_data)
+            self.dag = DagSerialization.from_dict(dag_result.dag_data)
             self.dag_fileloc = dag_result.fileloc
             workflow.logger.info(
                 f"Loaded DAG: {self.dag.dag_id} with {len(self.dag.task_dict)} tasks "

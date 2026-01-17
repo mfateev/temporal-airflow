@@ -86,7 +86,7 @@ def _prewarm_imports() -> None:
         pass  # Not required, may not be installed
 
     # Pre-import Airflow serialization (triggers plugin loading)
-    from airflow.serialization.serialized_objects import SerializedDAG
+    from airflow.serialization.serialized_objects import DagSerialization
     from airflow.models.serialized_dag import SerializedDagModel
     from airflow.utils.session import create_session
 
@@ -103,7 +103,7 @@ def _prewarm_imports() -> None:
             if serialized:
                 logger.info(f"Warming up deserialization with DAG: {serialized.dag_id}")
                 deser_start = time.time()
-                _ = SerializedDAG.from_dict(serialized.data)
+                _ = DagSerialization.from_dict(serialized.data)
                 deser_time = time.time() - deser_start
                 logger.info(f"DAG deserialization warmup: {deser_time*1000:.0f}ms")
             else:
