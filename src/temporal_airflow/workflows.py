@@ -18,7 +18,7 @@ with workflow.unsafe.imports_passed_through():
     from airflow.models.taskinstance import TaskInstance, TaskInstanceState
     from airflow.models.trigger import Trigger  # Required for TaskInstance.trigger_id FK
     from airflow.models.tasklog import LogTemplate  # Required for DagRun.log_template_id FK
-    from airflow.serialization.serialized_objects import SerializedDAG  # Still needed for DAG deserialization
+    from airflow.serialization.serialized_objects import DagSerialization, SerializedDAG
     from airflow._shared.timezones import timezone as airflow_timezone
     from airflow.utils.time_provider import set_time_provider, clear_time_provider
     from sqlalchemy import create_engine
@@ -57,6 +57,7 @@ class ExecuteAirflowDagWorkflow:
         # Decision 3 & 7: DAG state management
         self.serialized_dag = None  # Full DAG (from input)
         self.dag = None  # Deserialized DAG
+        self.dag_rel_path = None  # Relative path to DAG file
 
         # Decision 7: XCom state in workflow
         self.xcom_store: dict[tuple, Any] = {}  # ti_key -> xcom_data
@@ -94,13 +95,26 @@ class ExecuteAirflowDagWorkflow:
 
             # Commit 2: Store and deserialize DAG (Decision 3)
             self.serialized_dag = input.serialized_dag
-            self.dag = SerializedDAG.from_dict(self.serialized_dag)
+            self.dag = DagSerialization.from_dict(self.serialized_dag)
+
+            # Extract DAG file path from serialized data
+            # fileloc is stored in serialized_dag['dag']['fileloc']
+            import os
+            dag_data = self.serialized_dag.get('dag', {})
+            fileloc = dag_data.get('fileloc', '')
+            dags_folder = os.environ.get("AIRFLOW__CORE__DAGS_FOLDER", "/opt/airflow/dags")
+            # Convert absolute path to relative path from DAGS_FOLDER
+            if fileloc.startswith(dags_folder):
+                self.dag_rel_path = fileloc[len(dags_folder):].lstrip('/')
+            else:
+                # Fallback: just use the filename
+                self.dag_rel_path = os.path.basename(fileloc) if fileloc else f"{input.dag_id}.py"
 
             # Standalone mode: Store connections/variables for passing to activities
             self.connections = input.connections
             self.variables = input.variables
 
-            workflow.logger.info(f"Deserialized DAG: {self.dag.dag_id}")
+            workflow.logger.info(f"Deserialized DAG: {self.dag.dag_id} (file: {self.dag_rel_path})")
 
             # Commit 3: Create DAG run
             dag_run_id = self._create_dag_run(
@@ -187,6 +201,21 @@ class ExecuteAirflowDagWorkflow:
         ]
         for table in required_tables:
             table.create(self.engine, checkfirst=True)
+
+        # Insert default LogTemplate (required for DagRun.log_template_id FK)
+        session = self.sessionFactory()
+        try:
+            # Check if log_template already exists
+            existing = session.query(LogTemplate).first()
+            if not existing:
+                log_template = LogTemplate(
+                    filename="{{ ti.dag_id }}/{{ ti.task_id }}/{{ ts }}/{{ try_number }}.log",
+                    elasticsearch_id="{{ ti.dag_id }}-{{ ti.task_id }}-{{ ts }}-{{ try_number }}",
+                )
+                session.add(log_template)
+                session.commit()
+        finally:
+            session.close()
 
         workflow.logger.info(f"Database initialized for workflow {workflow_id}")
 
@@ -354,9 +383,6 @@ class ExecuteAirflowDagWorkflow:
         # Get logical date from dag_run
         logical_date = self._get_logical_date(dag_run_id)
 
-        # Create DAG file path (relative to DAGS_FOLDER)
-        dag_rel_path = f"{ti.dag_id}.py"
-
         workflow.logger.info(
             f"Starting activity for {ti_key} on queue '{activity_queue}'"
         )
@@ -370,7 +396,7 @@ class ExecuteAirflowDagWorkflow:
                 logical_date=logical_date,
                 try_number=ti.try_number,
                 map_index=ti.map_index,
-                dag_rel_path=dag_rel_path,
+                dag_rel_path=self.dag_rel_path,
                 upstream_results=upstream_results,
                 queue=ti.queue,
                 pool_slots=ti.pool_slots,

@@ -1,0 +1,50 @@
+# Dockerfile for running temporal-airflow tests
+#
+# Extends the main airflow-temporal image with test dependencies.
+#
+# Build:
+#   docker build -t airflow-temporal:test -f docker/Dockerfile.test .
+#
+# Run all tests:
+#   docker run --rm airflow-temporal:test
+#
+# Run specific test file:
+#   docker run --rm airflow-temporal:test pytest temporal_airflow/tests/test_sensors.py -v
+#
+# Run with local code changes (development):
+#   docker run --rm \
+#     -v $(pwd)/src/temporal_airflow:/opt/airflow/temporal_airflow \
+#     -v $(pwd)/examples:/opt/airflow/examples \
+#     airflow-temporal:test pytest temporal_airflow/tests/test_sensors.py -v
+
+FROM airflow-temporal:latest
+
+USER root
+
+# Install test dependencies
+RUN pip install --no-cache-dir \
+    pytest>=8.0 \
+    pytest-asyncio>=0.23 \
+    pytest-timeout>=2.0
+
+# Copy test DAGs and link them
+COPY --chown=airflow:0 examples /opt/airflow/examples
+
+# Create symlinks for test DAGs (same as in src/temporal_airflow/)
+RUN ln -sf /opt/airflow/examples/test_sensors.py /opt/airflow/temporal_airflow/test_sensors.py && \
+    ln -sf /opt/airflow/examples/test_dag.py /opt/airflow/temporal_airflow/test_dag.py && \
+    ln -sf /opt/airflow/examples/test_loop_structure.py /opt/airflow/temporal_airflow/test_loop_structure.py && \
+    ln -sf /opt/airflow/examples/test_mixed_results.py /opt/airflow/temporal_airflow/test_mixed_results.py && \
+    ln -sf /opt/airflow/examples/test_parallel.py /opt/airflow/temporal_airflow/test_parallel.py && \
+    ln -sf /opt/airflow/examples/test_scheduled_dag.py /opt/airflow/temporal_airflow/test_scheduled_dag.py
+
+# Set environment for tests
+ENV AIRFLOW__CORE__DAGS_FOLDER=/opt/airflow/temporal_airflow
+ENV PYTHONPATH=/opt/airflow
+
+USER airflow
+
+WORKDIR /opt/airflow
+
+# Default: run all tests
+CMD ["pytest", "temporal_airflow/tests/", "-v", "--tb=short"]

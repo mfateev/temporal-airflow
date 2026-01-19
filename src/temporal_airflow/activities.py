@@ -3,16 +3,17 @@ from __future__ import annotations
 import os
 import urllib.parse
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Generator
 
 import structlog
 from temporalio import activity
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ApplicationError, ApplicationErrorCategory
 
 from airflow.utils.state import TaskInstanceState
 from airflow.sdk.bases.operator import ExecutorSafeguard
+from airflow.sdk.bases.sensor import BaseSensorOperator, PokeReturnValue
 from temporal_airflow.models import (
     ActivityTaskInput,
     TaskExecutionResult,
@@ -270,18 +271,61 @@ def run_airflow_task(input: ActivityTaskInput) -> TaskExecutionResult:
             context["task_instance"] = MinimalTI(xcom_pull)
             context["ti"] = context["task_instance"]
 
-            activity.logger.info(f"Executing {task.__class__.__name__}.execute()")
+            # Step 4: Execute task - sensors use poke(), regular operators use execute()
+            if isinstance(task, BaseSensorOperator):
+                # Sensors: call poke() and let Temporal handle retry loop
+                # This is more efficient than Airflow's built-in polling loop
+                activity.logger.info(
+                    f"Executing sensor {task.__class__.__name__}.poke() "
+                    f"(poke_interval={task.poke_interval}s)"
+                )
 
-            # Step 4: Execute task with real operator (NO serialization!)
-            # This is the key benefit: we have real callables, not string representations
-            # Add ExecutorSafeguard sentinel to allow direct execute() calls outside Task Runner
-            # NOTE: Must pass as kwarg, not in context dict (ExecutorSafeguard checks kwargs)
-            sentinel_key = f"{task.__class__.__name__}__sentinel"
-            result = task.execute(context, **{sentinel_key: ExecutorSafeguard.sentinel_value})
+                poke_result = task.poke(context)
 
-            activity.logger.info(
-                f"Task executed successfully, result type: {type(result).__name__}"
-            )
+                # Handle PokeReturnValue (Airflow 2.3+) or boolean result
+                if isinstance(poke_result, PokeReturnValue):
+                    if poke_result.is_done:
+                        result = poke_result.xcom_value
+                        activity.logger.info(
+                            f"Sensor condition met, xcom_value type: {type(result).__name__}"
+                        )
+                    else:
+                        # Condition not met - retry via BENIGN error
+                        # BENIGN category prevents error logging and failure metrics
+                        activity.logger.info(
+                            f"Sensor condition not met, scheduling retry in {task.poke_interval}s"
+                        )
+                        raise ApplicationError(
+                            f"Sensor {task.task_id} condition not met",
+                            category=ApplicationErrorCategory.BENIGN,
+                            next_retry_delay=timedelta(seconds=task.poke_interval),
+                        )
+                elif poke_result:
+                    # Boolean True - condition met
+                    result = True
+                    activity.logger.info("Sensor condition met (boolean True)")
+                else:
+                    # Boolean False - condition not met, retry
+                    activity.logger.info(
+                        f"Sensor condition not met, scheduling retry in {task.poke_interval}s"
+                    )
+                    raise ApplicationError(
+                        f"Sensor {task.task_id} condition not met",
+                        category=ApplicationErrorCategory.BENIGN,
+                        next_retry_delay=timedelta(seconds=task.poke_interval),
+                    )
+            else:
+                # Regular operators: call execute() as usual
+                activity.logger.info(f"Executing {task.__class__.__name__}.execute()")
+
+                # Add ExecutorSafeguard sentinel to allow direct execute() calls outside Task Runner
+                # NOTE: Must pass as kwarg, not in context dict (ExecutorSafeguard checks kwargs)
+                sentinel_key = f"{task.__class__.__name__}__sentinel"
+                result = task.execute(context, **{sentinel_key: ExecutorSafeguard.sentinel_value})
+
+                activity.logger.info(
+                    f"Task executed successfully, result type: {type(result).__name__}"
+                )
 
             # Step 5: Package result as JSON (must be JSON-serializable for Temporal)
             # Workflow will store this in XCom table in its in-memory DB
@@ -307,6 +351,10 @@ def run_airflow_task(input: ActivityTaskInput) -> TaskExecutionResult:
                 return_value=result,
                 xcom_data=xcom_data,
             )
+
+    except ApplicationError:
+        # Re-raise ApplicationError (including BENIGN sensor retries) without wrapping
+        raise
 
     except Exception as e:
         end_time = datetime.now(timezone.utc)
