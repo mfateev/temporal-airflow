@@ -80,7 +80,7 @@ def _prewarm_imports() -> None:
         pass  # Not required, may not be installed
 
     # Pre-import Airflow serialization (triggers plugin loading)
-    from airflow.serialization.serialized_objects import SerializedDAG  # noqa: F401
+    from airflow.serialization.serialized_objects import DagSerialization  # noqa: F401
 
     # Pre-initialize plugin manager (loads plugins from plugins folder)
     from airflow import plugins_manager

@@ -75,8 +75,8 @@ logger = logging.getLogger(__name__)
 
 def serialize_dag(dag) -> dict[str, Any]:
     """Serialize DAG using Airflow's serialization."""
-    from airflow.serialization.serialized_objects import SerializedDAG
-    return SerializedDAG.to_dict(dag)
+    from airflow.serialization.serialized_objects import DagSerialization
+    return DagSerialization.to_dict(dag)
 
 
 async def submit_dag(

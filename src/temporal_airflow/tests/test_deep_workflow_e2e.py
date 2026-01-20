@@ -40,7 +40,7 @@ from temporalio.worker import Worker
 from airflow.models.dagrun import DagRun
 from airflow.models.serialized_dag import SerializedDagModel
 from airflow.models.taskinstance import TaskInstance
-from airflow.serialization.serialized_objects import SerializedDAG
+from airflow.serialization.definitions.dag import SerializedDAG
 from airflow.utils.session import create_session
 from airflow.utils.state import DagRunState, TaskInstanceState
 from airflow.utils.types import DagRunType
@@ -137,7 +137,8 @@ def _serialize_dag_to_db(dag):
     from airflow.models.dagbundle import DagBundleModel
     from airflow.models.dag_version import DagVersion
     from airflow.models.dagcode import DagCode
-    from airflow.serialization.serialized_objects import LazyDeserializedDAG, SerializedDAG
+    from airflow.serialization.serialized_objects import LazyDeserializedDAG
+    from airflow.serialization.definitions.dag import SerializedDAG
 
     bundle_name = "test-bundle"
     dag_id = dag.dag_id

@@ -475,7 +475,8 @@ if AIRFLOW_AVAILABLE:
         from airflow.models.dagbundle import DagBundleModel
         from airflow.models.dag_version import DagVersion
         from airflow.models.dagcode import DagCode
-        from airflow.serialization.serialized_objects import LazyDeserializedDAG, SerializedDAG
+        from airflow.serialization.serialized_objects import LazyDeserializedDAG
+        from airflow.serialization.definitions.dag import SerializedDAG
 
         bundle_name = "test-bundle"
         dag_id = dag.dag_id

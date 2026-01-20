@@ -93,7 +93,7 @@ async def test_workflow_database_initialization():
     """Test that workflow initializes its own database without deadlocks."""
     from airflow import DAG
     from airflow.operators.python import PythonOperator
-    from airflow.serialization.serialized_objects import SerializedDAG
+    from airflow.serialization.serialized_objects import DagSerialization
     from temporal_airflow.activities import run_airflow_task
     from temporalio.client import WorkflowFailureError
     from temporalio.exceptions import ApplicationError
@@ -106,7 +106,7 @@ async def test_workflow_database_initialization():
         PythonOperator(task_id="task1", python_callable=simple_task)
 
     # Serialize it properly
-    serialized = SerializedDAG.to_dict(dag)
+    serialized = DagSerialization.to_dict(dag)
 
     async with await WorkflowEnvironment.start_time_skipping() as env:
         # Create input with properly serialized DAG
@@ -151,7 +151,7 @@ async def test_workflow_database_initialization():
 #     """Test that multiple workflows have isolated databases."""
 #     from airflow import DAG
 #     from airflow.operators.empty import EmptyOperator
-#     from airflow.serialization.serialized_objects import SerializedDAG
+#     from airflow.serialization.serialized_objects import DagSerialization
 #     from temporal_airflow.activities import run_airflow_task
 #
 #     # Create two DAGs
@@ -162,8 +162,8 @@ async def test_workflow_database_initialization():
 #         EmptyOperator(task_id="task1")
 #
 #     # Serialize them
-#     serialized1 = SerializedDAG.to_dict(dag1)
-#     serialized2 = SerializedDAG.to_dict(dag2)
+#     serialized1 = DagSerialization.to_dict(dag1)
+#     serialized2 = DagSerialization.to_dict(dag2)
 #
 #     async with await WorkflowEnvironment.start_time_skipping() as env:
 #         input1 = DagExecutionInput(
@@ -212,7 +212,7 @@ async def test_dag_deserialization():
     """Test that workflow deserializes DAG correctly."""
     from airflow import DAG
     from airflow.operators.python import PythonOperator
-    from airflow.serialization.serialized_objects import SerializedDAG
+    from airflow.serialization.serialized_objects import DagSerialization
     from temporal_airflow.activities import run_airflow_task
 
     # Create a real DAG
@@ -220,7 +220,7 @@ async def test_dag_deserialization():
         PythonOperator(task_id="task1", python_callable=lambda: None)
 
     # Serialize it
-    serialized = SerializedDAG.to_dict(dag)
+    serialized = DagSerialization.to_dict(dag)
 
     async with await WorkflowEnvironment.start_time_skipping() as env:
         input_data = DagExecutionInput(
@@ -252,7 +252,7 @@ async def test_dag_run_creation():
     """Test that workflow creates DagRun and TaskInstances."""
     from airflow import DAG
     from airflow.operators.python import PythonOperator
-    from airflow.serialization.serialized_objects import SerializedDAG
+    from airflow.serialization.serialized_objects import DagSerialization
     from temporal_airflow.activities import run_airflow_task
 
     # Create DAG with tasks
@@ -261,7 +261,7 @@ async def test_dag_run_creation():
         t2 = PythonOperator(task_id="task2", python_callable=lambda: None)
         t1 >> t2
 
-    serialized = SerializedDAG.to_dict(dag)
+    serialized = DagSerialization.to_dict(dag)
 
     async with await WorkflowEnvironment.start_time_skipping() as env:
         input_data = DagExecutionInput(
@@ -293,7 +293,7 @@ async def test_scheduling_loop_structure():
     """Test that loop structure works (completion in Commit 5)."""
     import sys
     from pathlib import Path
-    from airflow.serialization.serialized_objects import SerializedDAG
+    from airflow.serialization.serialized_objects import DagSerialization
     from temporal_airflow.activities import run_airflow_task
 
     # Load DAG from file (executor pattern)
@@ -314,7 +314,7 @@ async def test_scheduling_loop_structure():
             break
 
     assert dag is not None, "Could not find test_loop_structure DAG"
-    serialized = SerializedDAG.to_dict(dag)
+    serialized = DagSerialization.to_dict(dag)
 
     async with await WorkflowEnvironment.start_time_skipping() as env:
         input_data = DagExecutionInput(
@@ -350,14 +350,14 @@ async def test_activity_starting():
     """Test that workflow starts activities for schedulable tasks."""
     from airflow import DAG
     from airflow.operators.python import PythonOperator
-    from airflow.serialization.serialized_objects import SerializedDAG
+    from airflow.serialization.serialized_objects import DagSerialization
     from temporal_airflow.activities import run_airflow_task
 
     # Create DAG with Python task
     with DAG(dag_id="test_dag", start_date=timezone.datetime(2025, 1, 1)) as dag:
         PythonOperator(task_id="task1", python_callable=lambda: "result1")
 
-    serialized = SerializedDAG.to_dict(dag)
+    serialized = DagSerialization.to_dict(dag)
 
     async with await WorkflowEnvironment.start_time_skipping() as env:
         input_data = DagExecutionInput(
@@ -391,7 +391,7 @@ async def test_end_to_end_dag_execution():
     """Test complete DAG execution with task completion handling."""
     from airflow import DAG
     from airflow.operators.python import PythonOperator
-    from airflow.serialization.serialized_objects import SerializedDAG
+    from airflow.serialization.serialized_objects import DagSerialization
     from temporal_airflow.activities import run_airflow_task
 
     # Create DAG with dependencies
@@ -406,7 +406,7 @@ async def test_end_to_end_dag_execution():
         t2 = PythonOperator(task_id="task2", python_callable=task2_func)
         t1 >> t2  # Sequential execution
 
-    serialized = SerializedDAG.to_dict(dag)
+    serialized = DagSerialization.to_dict(dag)
 
     async with await WorkflowEnvironment.start_time_skipping() as env:
         input_data = DagExecutionInput(
@@ -439,7 +439,7 @@ async def test_end_to_end_dag_execution():
 async def test_parallel_task_execution():
     """Test that parallel tasks execute concurrently."""
     from pathlib import Path
-    from airflow.serialization.serialized_objects import SerializedDAG
+    from airflow.serialization.serialized_objects import DagSerialization
     from temporal_airflow.activities import run_airflow_task
 
     # Load DAG from file (executor pattern)
@@ -460,7 +460,7 @@ async def test_parallel_task_execution():
             break
 
     assert dag is not None, "Could not find test_parallel DAG"
-    serialized = SerializedDAG.to_dict(dag)
+    serialized = DagSerialization.to_dict(dag)
 
     async with await WorkflowEnvironment.start_time_skipping() as env:
         input_data = DagExecutionInput(
@@ -495,7 +495,7 @@ async def test_task_failure_with_application_error():
     """Test that task failures raise ApplicationError with structured details."""
     from airflow import DAG
     from airflow.operators.python import PythonOperator
-    from airflow.serialization.serialized_objects import SerializedDAG
+    from airflow.serialization.serialized_objects import DagSerialization
     from temporal_airflow.activities import run_airflow_task
     from temporalio.client import WorkflowFailureError
     from temporalio.exceptions import ApplicationError
@@ -508,7 +508,7 @@ async def test_task_failure_with_application_error():
     with DAG(dag_id="test_dag", start_date=timezone.datetime(2025, 1, 1)) as dag:
         PythonOperator(task_id="failing_task", python_callable=failing_task)
 
-    serialized = SerializedDAG.to_dict(dag)
+    serialized = DagSerialization.to_dict(dag)
 
     async with await WorkflowEnvironment.start_time_skipping() as env:
         input_data = DagExecutionInput(
@@ -550,7 +550,7 @@ async def test_task_failure_with_application_error():
 async def test_mixed_success_and_failure_tasks():
     """Test DAG with both successful and failing tasks."""
     from pathlib import Path
-    from airflow.serialization.serialized_objects import SerializedDAG
+    from airflow.serialization.serialized_objects import DagSerialization
     from temporal_airflow.activities import run_airflow_task
     from temporalio.client import WorkflowFailureError
     from temporalio.exceptions import ApplicationError
@@ -574,7 +574,7 @@ async def test_mixed_success_and_failure_tasks():
             break
 
     assert dag is not None, "Could not find test_mixed_results DAG"
-    serialized = SerializedDAG.to_dict(dag)
+    serialized = DagSerialization.to_dict(dag)
 
     async with await WorkflowEnvironment.start_time_skipping() as env:
         input_data = DagExecutionInput(

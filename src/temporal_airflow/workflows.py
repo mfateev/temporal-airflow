@@ -18,7 +18,7 @@ with workflow.unsafe.imports_passed_through():
     from airflow.models.taskinstance import TaskInstance, TaskInstanceState
     from airflow.models.trigger import Trigger  # Required for TaskInstance.trigger_id FK
     from airflow.models.tasklog import LogTemplate  # Required for DagRun.log_template_id FK
-    from airflow.serialization.serialized_objects import DagSerialization, SerializedDAG
+    from airflow.serialization.serialized_objects import DagSerialization
     from airflow._shared.timezones import timezone as airflow_timezone
     from airflow.utils.time_provider import set_time_provider, clear_time_provider
     from sqlalchemy import create_engine
