@@ -22,6 +22,16 @@ from temporal_airflow.models import (
 
 logger = structlog.get_logger()
 
+# Module cache for DAG files - avoids re-parsing on every activity invocation
+# Key: (dag_file_path, dag_id) -> DAG object
+_dag_cache: dict[tuple[str, str], Any] = {}
+
+
+def clear_dag_cache():
+    """Clear the DAG cache. Useful for testing."""
+    global _dag_cache
+    _dag_cache.clear()
+
 
 def _build_connection_uri(conn_data: dict[str, Any]) -> str:
     """
@@ -134,10 +144,14 @@ def _setup_airflow_env(
 
 def load_dag_from_file(dag_rel_path: str, dag_id: str):
     """
-    Load DAG from Python file.
+    Load DAG from Python file with caching.
 
     This is the core of the executor pattern: activities load DAG files
     and get real operators with real callables (no serialization).
+
+    DAGs are cached at the worker level to avoid re-parsing Python files
+    on every activity invocation. This also preserves module-level state
+    (like global variables) across activity retries.
 
     Args:
         dag_rel_path: Relative path from DAGS_FOLDER (e.g., "dags/my_dag.py")
@@ -150,11 +164,19 @@ def load_dag_from_file(dag_rel_path: str, dag_id: str):
         FileNotFoundError: If DAG file doesn't exist
         ValueError: If DAG not found in file
     """
+    global _dag_cache
+
     # Get DAGS_FOLDER from environment or use default
     dags_folder = os.environ.get("AIRFLOW__CORE__DAGS_FOLDER", "/opt/airflow/dags")
 
     # Construct full path
     dag_file = Path(dags_folder) / dag_rel_path
+    cache_key = (str(dag_file), dag_id)
+
+    # Check cache first
+    if cache_key in _dag_cache:
+        activity.logger.debug(f"Using cached DAG '{dag_id}' from {dag_file}")
+        return _dag_cache[cache_key]
 
     if not dag_file.exists():
         raise FileNotFoundError(
@@ -189,6 +211,9 @@ def load_dag_from_file(dag_rel_path: str, dag_id: str):
             f"DAG '{dag_id}' not found in {dag_file}. "
             f"Available DAGs: {[getattr(module, name).dag_id for name in dir(module) if isinstance(getattr(module, name), DAG)]}"
         )
+
+    # Cache the DAG for future invocations
+    _dag_cache[cache_key] = dag
 
     activity.logger.info(
         f"Loaded DAG '{dag.dag_id}' with {len(dag.task_dict)} tasks from {dag_file}"

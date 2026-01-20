@@ -39,11 +39,21 @@ def set_dags_folder():
 
 @pytest.fixture(autouse=True)
 def reset_sensor_counts():
-    """Reset global poke counts before each test."""
+    """Reset global poke counts and DAG cache before each test.
+
+    We must clear both because:
+    1. The DAG cache holds module instances loaded as 'temp_dag_module'
+    2. Each module instance has its own _poke_counts dictionary
+    3. Without clearing the cache, reset_poke_counts() only clears the
+       test file's _poke_counts, not the cached module's copy
+    """
     from temporal_airflow.test_sensors import reset_poke_counts
+    from temporal_airflow.activities import clear_dag_cache
+    clear_dag_cache()  # Clear cached DAG modules first
     reset_poke_counts()
     yield
     reset_poke_counts()
+    clear_dag_cache()
 
 
 # Configure sandbox to pass through problematic modules
@@ -239,7 +249,6 @@ async def test_immediate_sensor_workflow():
             await assert_no_workflow_task_failures(env.client, workflow_id)
 
 
-@pytest.mark.skip(reason="Countdown sensor uses global state that doesn't persist across Temporal activity retries")
 @pytest.mark.asyncio
 async def test_countdown_sensor_workflow():
     """Test workflow with sensor that needs multiple pokes to succeed."""
@@ -364,7 +373,6 @@ async def test_sensor_with_downstream_task():
             await assert_no_workflow_task_failures(env.client, workflow_id)
 
 
-@pytest.mark.skip(reason="DelayedXCom sensor uses global state that doesn't persist across Temporal activity retries")
 @pytest.mark.asyncio
 async def test_delayed_xcom_sensor_workflow():
     """Test workflow with sensor using PokeReturnValue with is_done=False."""

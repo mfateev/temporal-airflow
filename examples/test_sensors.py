@@ -127,9 +127,13 @@ class FileSensorSimple(BaseSensorOperator):
 
 
 def reset_poke_counts():
-    """Reset global poke counts (call between tests)."""
+    """Reset global poke counts (call between tests).
+
+    Note: Must clear in-place (not replace) because cached DAG modules
+    hold references to the original dictionary.
+    """
     global _poke_counts
-    _poke_counts = {}
+    _poke_counts.clear()
 
 
 # ============================================================================
