@@ -318,6 +318,7 @@ def api_test_client():
             conf.set("core", "auth_manager", old_value)
 
 
+@pytest.mark.usefixtures("airflow_db")
 class TestE2ERealTemporal:
     """End-to-end tests using real Temporal service."""
 

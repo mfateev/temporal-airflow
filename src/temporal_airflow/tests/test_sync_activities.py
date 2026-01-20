@@ -65,7 +65,7 @@ def test_dag():
 
 
 @pytest.fixture
-def serialized_dag(test_dag):
+def serialized_dag(test_dag, airflow_db):
     """Serialize and save the test DAG to the database."""
     from airflow.models.dag import DagModel
     from airflow.models.dagbundle import DagBundleModel
@@ -202,7 +202,7 @@ class TestCreateDagRunRecordReal:
         assert second_result.dag_run_id == first_result.dag_run_id
         assert second_result.run_id == first_result.run_id
 
-    def test_raises_error_for_missing_serialized_dag(self):
+    def test_raises_error_for_missing_serialized_dag(self, airflow_db):
         """create_dagrun_record should raise ApplicationError if DAG not found."""
         input_data = CreateDagRunInput(
             dag_id="nonexistent_dag_12345",
@@ -303,7 +303,7 @@ class TestSyncDagRunStatusReal:
             assert dag_run.state == DagRunState.SUCCESS
             assert dag_run.end_date == sync_input.end_date
 
-    def test_handles_missing_dagrun(self):
+    def test_handles_missing_dagrun(self, airflow_db):
         """sync_dagrun_status should handle missing DagRun gracefully."""
         input_data = DagRunStatusSync(
             dag_id="test_sync_activities_dag",
@@ -334,7 +334,7 @@ class TestLoadSerializedDagReal:
         assert result.fileloc is not None
         assert isinstance(result.fileloc, str)
 
-    def test_raises_error_for_missing_dag(self):
+    def test_raises_error_for_missing_dag(self, airflow_db):
         """load_serialized_dag should raise ApplicationError if DAG not found."""
         input_data = LoadSerializedDagInput(dag_id="nonexistent_dag_67890")
 
@@ -373,7 +373,7 @@ class TestEnsureTaskInstancesReal:
             )
             assert len(task_instances) == 2
 
-    def test_raises_error_for_missing_dagrun(self):
+    def test_raises_error_for_missing_dagrun(self, airflow_db):
         """ensure_task_instances should raise ApplicationError if DagRun not found."""
         input_data = EnsureTaskInstancesInput(
             dag_id="test_sync_activities_dag",

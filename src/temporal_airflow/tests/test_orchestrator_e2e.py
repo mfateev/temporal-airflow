@@ -247,6 +247,7 @@ async def create_test_orchestrator():
             yield orchestrator, env
 
 
+@pytest.mark.usefixtures("airflow_db")
 class TestOrchestratorE2E:
     """End-to-end tests for TemporalOrchestrator using test environment."""
 

@@ -253,6 +253,7 @@ def api_test_client():
         )
 
 
+@pytest.mark.usefixtures("airflow_db")
 class TestAPIIntegration:
     """Test that Airflow REST API correctly reads data written by Temporal workflows."""
 

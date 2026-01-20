@@ -299,6 +299,7 @@ def api_client():
             conf.set("core", "auth_manager", old_value)
 
 
+@pytest.mark.usefixtures("airflow_db")
 class TestAirflowUserExperienceWithTemporalOrchestrator:
     """
     Tests that simulate a real Airflow user experience.
