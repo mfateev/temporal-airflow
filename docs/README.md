@@ -172,8 +172,9 @@ curl -X POST "http://localhost:8080/api/v2/dags/example_dag/dagRuns" \
 
 ## Further Reading
 
-- [Deep Integration Design](DEEP_INTEGRATION_DESIGN.md) - Architecture details
+- [Deep Integration Design](DEEP_INTEGRATION_DESIGN.md) - Detailed architecture and design decisions
 - [Standalone Mode](STANDALONE_MODE.md) - Running without Airflow DB
-- [Implementation Plan](DEEP_INTEGRATION_IMPLEMENTATION_PLAN.md) - Development roadmap
+- [Feature Implementation Plan](AIRFLOW_FEATURES_IMPLEMENTATION_PLAN.md) - Feature roadmap and status
+- [Design Decisions](TEMPORAL_DECISIONS.md) - Technical decision rationale
 - [Temporal Documentation](https://docs.temporal.io/)
 - [Airflow Documentation](https://airflow.apache.org/docs/)
