@@ -29,7 +29,7 @@ from __future__ import annotations
 import datetime
 import importlib.util
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import timezone as tz
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -50,6 +50,43 @@ from airflow.utils.session import create_session
 from airflow.utils.state import DagRunState, TaskInstanceState
 from airflow.utils.types import DagRunType
 
+
+@contextmanager
+def conf_vars(overrides: dict[tuple[str, str], str | None]):
+    """
+    Context manager to temporarily override Airflow configuration values.
+
+    This is a local implementation that replaces the tests_common.test_utils.config.conf_vars
+    which is not available outside Airflow's test infrastructure.
+
+    Airflow reads configuration from environment variables in the format:
+    AIRFLOW__SECTION__KEY (e.g., AIRFLOW__CORE__AUTH_MANAGER)
+
+    Args:
+        overrides: Dictionary mapping (section, key) tuples to values.
+                   Use None as value to temporarily remove a config.
+    """
+    original_values = {}
+
+    for (section, key), value in overrides.items():
+        env_var = f"AIRFLOW__{section.upper()}__{key.upper()}"
+        original_values[env_var] = os.environ.get(env_var)
+
+        if value is None:
+            os.environ.pop(env_var, None)
+        else:
+            os.environ[env_var] = value
+
+    try:
+        yield
+    finally:
+        # Restore original values
+        for env_var, original_value in original_values.items():
+            if original_value is None:
+                os.environ.pop(env_var, None)
+            else:
+                os.environ[env_var] = original_value
+
 from temporal_airflow.activities import run_airflow_task
 from temporal_airflow.deep_workflow import ExecuteAirflowDagDeepWorkflow
 from temporal_airflow.models import DeepDagExecutionInput
@@ -57,6 +94,7 @@ from temporal_airflow.orchestrator import TemporalOrchestrator
 from temporal_airflow.sync_activities import (
     create_dagrun_record,
     sync_task_status,
+    sync_task_status_batch,
     sync_dagrun_status,
     load_serialized_dag,
     ensure_task_instances,
@@ -161,6 +199,7 @@ def _serialize_dag_to_db(dag):
 ALL_ACTIVITIES = [
     create_dagrun_record,
     sync_task_status,
+    sync_task_status_batch,
     sync_dagrun_status,
     load_serialized_dag,
     ensure_task_instances,
@@ -219,7 +258,6 @@ async def create_test_orchestrator():
 @pytest.fixture
 def api_test_client():
     """Create an authenticated Airflow API test client."""
-    from tests_common.test_utils.config import conf_vars
     from airflow.api_fastapi.app import create_app
     from airflow.api_fastapi.auth.managers.simple.simple_auth_manager import SimpleAuthManager
     from airflow.api_fastapi.auth.managers.simple.user import SimpleAuthManagerUser

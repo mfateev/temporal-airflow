@@ -64,9 +64,11 @@ from airflow.utils.state import DagRunState, TaskInstanceState
 from airflow.utils.types import DagRunType
 
 from temporal_airflow.activities import run_airflow_task
-from temporal_airflow.client_config import create_temporal_client, get_task_queue
+from temporal_airflow.client_config import create_temporal_client
 from temporal_airflow.deep_workflow import ExecuteAirflowDagDeepWorkflow
 from temporal_airflow.models import DeepDagExecutionInput
+
+
 from temporal_airflow.sync_activities import (
     create_dagrun_record,
     sync_task_status,
@@ -88,6 +90,20 @@ ALL_ACTIVITIES = [
     ensure_task_instances,
     run_airflow_task,
 ]
+
+
+def get_test_task_queue() -> str:
+    """
+    Get a unique task queue for tests.
+
+    Uses a test-specific task queue to avoid conflicts with other workers
+    (e.g., docker-compose workers) that may be running on the same Temporal server.
+    This ensures test workflows are only processed by the test worker.
+    """
+    import uuid
+    # Generate a unique queue name for this test run
+    # This prevents conflicts with other workers on shared Temporal servers
+    return f"airflow-tasks-test-{uuid.uuid4().hex[:8]}"
 
 
 def is_temporal_available() -> bool:
@@ -326,7 +342,7 @@ class TestAirflowUserExperienceWithTemporalOrchestrator:
 
         try:
             client = await create_temporal_client()
-            task_queue = get_task_queue()
+            task_queue = get_test_task_queue()
 
             async with run_worker_in_background(client, task_queue):
                 # === AIRFLOW USER EXPERIENCE: Trigger DAG via API ===
@@ -454,7 +470,7 @@ class TestAirflowUserExperienceWithTemporalOrchestrator:
 
         try:
             client = await create_temporal_client()
-            task_queue = get_task_queue()
+            task_queue = get_test_task_queue()
 
             async with run_worker_in_background(client, task_queue):
                 # Use unique logical date based on timestamp
@@ -598,7 +614,7 @@ class TestAirflowUserExperienceWithTemporalOrchestrator:
 
         try:
             client = await create_temporal_client()
-            task_queue = get_task_queue()
+            task_queue = get_test_task_queue()
 
             async with run_worker_in_background(client, task_queue):
                 # Use unique logical date
@@ -692,7 +708,7 @@ class TestAirflowUserExperienceWithTemporalOrchestrator:
 
         try:
             client = await create_temporal_client()
-            task_queue = get_task_queue()
+            task_queue = get_test_task_queue()
 
             async with run_worker_in_background(client, task_queue):
                 # Use unique logical date
@@ -781,7 +797,7 @@ class TestAirflowUserExperienceWithTemporalOrchestrator:
 
         try:
             client = await create_temporal_client()
-            task_queue = get_task_queue()
+            task_queue = get_test_task_queue()
 
             async with run_worker_in_background(client, task_queue):
                 # Use unique logical date
