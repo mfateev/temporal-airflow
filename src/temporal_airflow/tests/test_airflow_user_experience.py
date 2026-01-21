@@ -72,6 +72,7 @@ from temporal_airflow.models import DeepDagExecutionInput
 from temporal_airflow.sync_activities import (
     create_dagrun_record,
     sync_task_status,
+    sync_task_status_batch,
     sync_dagrun_status,
     load_serialized_dag,
     ensure_task_instances,
@@ -85,6 +86,7 @@ TEST_DAGS_FOLDER = Path(__file__).parent.parent
 ALL_ACTIVITIES = [
     create_dagrun_record,
     sync_task_status,
+    sync_task_status_batch,
     sync_dagrun_status,
     load_serialized_dag,
     ensure_task_instances,
