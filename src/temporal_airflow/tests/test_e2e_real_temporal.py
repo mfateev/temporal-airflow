@@ -67,12 +67,13 @@ from airflow.utils.state import DagRunState, TaskInstanceState
 from airflow.utils.types import DagRunType
 
 from temporal_airflow.activities import run_airflow_task
-from temporal_airflow.client_config import create_temporal_client, get_task_queue
+from temporal_airflow.client_config import create_temporal_client
 from temporal_airflow.deep_workflow import ExecuteAirflowDagDeepWorkflow
 from temporal_airflow.models import DeepDagExecutionInput
 from temporal_airflow.sync_activities import (
     create_dagrun_record,
     sync_task_status,
+    sync_task_status_batch,
     sync_dagrun_status,
     load_serialized_dag,
     ensure_task_instances,
@@ -86,6 +87,7 @@ TEST_DAGS_FOLDER = Path(__file__).parent.parent
 ALL_ACTIVITIES = [
     create_dagrun_record,
     sync_task_status,
+    sync_task_status_batch,
     sync_dagrun_status,
     load_serialized_dag,
     ensure_task_instances,
@@ -332,7 +334,8 @@ class TestE2ERealTemporal:
         try:
             # Connect to real Temporal server
             client = await create_temporal_client()
-            task_queue = get_task_queue()
+            # Use unique task queue to avoid conflicts with other workers
+            task_queue = f"test-e2e-{int(time.time())}"
 
             print(f"\nConnected to Temporal at {client.service_client.config.target_host}")
             print(f"Task queue: {task_queue}")
@@ -408,7 +411,8 @@ class TestE2ERealTemporal:
 
         try:
             client = await create_temporal_client()
-            task_queue = get_task_queue()
+            # Use unique task queue to avoid conflicts with other workers
+            task_queue = f"test-e2e-parallel-{int(time.time())}"
 
             async with run_worker_in_background(client, task_queue):
                 logical_date = datetime.datetime(2025, 9, 2, tzinfo=tz.utc)
@@ -463,7 +467,8 @@ class TestE2ERealTemporal:
 
         try:
             client = await create_temporal_client()
-            task_queue = get_task_queue()
+            # Use unique task queue to avoid conflicts with other workers
+            task_queue = f"test-e2e-failure-{int(time.time())}"
 
             async with run_worker_in_background(client, task_queue):
                 logical_date = datetime.datetime(2025, 9, 3, tzinfo=tz.utc)
@@ -534,7 +539,8 @@ class TestE2ERealTemporal:
 
         try:
             client = await create_temporal_client()
-            task_queue = get_task_queue()
+            # Use unique task queue to avoid conflicts with other workers
+            task_queue = f"test-e2e-monitor-{int(time.time())}"
 
             async with run_worker_in_background(client, task_queue):
                 logical_date = datetime.datetime(2025, 9, 4, tzinfo=tz.utc)
@@ -593,7 +599,8 @@ class TestE2ERealTemporal:
 
         try:
             client = await create_temporal_client()
-            task_queue = get_task_queue()
+            # Use unique task queue to avoid conflicts with other workers
+            task_queue = f"test-e2e-cli-{int(time.time())}"
 
             async with run_worker_in_background(client, task_queue):
                 logical_date = datetime.datetime(2025, 9, 5, tzinfo=tz.utc)
