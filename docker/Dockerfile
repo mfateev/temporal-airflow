@@ -139,7 +139,8 @@ RUN pip install --no-cache-dir \
     'apache-airflow-providers-smtp>=2.3.1' \
     'apache-airflow-providers-standard>=1.9.0' \
     # Temporal
-    temporalio
+    temporalio \
+    nest-asyncio
 
 # Re-install our custom packages to ensure they override any PyPI packages pulled by providers
 RUN pip install --no-cache-dir --no-build-isolation --force-reinstall --no-deps \
