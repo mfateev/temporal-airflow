@@ -138,6 +138,8 @@ RUN pip install --no-cache-dir \
     'apache-airflow-providers-common-sql>=1.28.1' \
     'apache-airflow-providers-smtp>=2.3.1' \
     'apache-airflow-providers-standard>=1.9.0' \
+    # Additional providers for real-world use cases
+    'apache-airflow-providers-http>=5.0.0' \
     # Temporal
     temporalio \
     nest-asyncio
