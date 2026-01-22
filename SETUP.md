@@ -93,26 +93,48 @@ docker-compose logs -f
 
 ```bash
 # From repository root
-docker build -f docker/Dockerfile.test -t temporal-airflow-test .
+docker build -f docker/Dockerfile.test -t airflow-temporal:test .
 ```
 
 ### Run All Tests
 
 ```bash
-docker run --rm temporal-airflow-test
+# Uses Temporal time-skipping test environment (no external server needed)
+docker run --rm airflow-temporal:test
 ```
 
 ### Run Specific Tests
 
 ```bash
 # Sensor tests only
-docker run --rm temporal-airflow-test pytest temporal_airflow/tests/test_sensors.py -v
+docker run --rm airflow-temporal:test pytest temporal_airflow/tests/test_sensors.py -v
 
 # With local code changes (development)
 docker run --rm \
   -v $(pwd)/src/temporal_airflow:/opt/airflow/temporal_airflow \
-  -v $(pwd)/examples:/opt/examples \
-  temporal-airflow-test pytest temporal_airflow/tests/test_sensors.py -v
+  -v $(pwd)/examples:/opt/airflow/examples \
+  airflow-temporal:test pytest temporal_airflow/tests/test_sensors.py -v
+```
+
+### Run E2E Tests with Real Temporal Server
+
+Some tests (E2E tests, Schedule API tests) require a real Temporal server:
+
+```bash
+# Start Temporal dev server (in a separate terminal)
+temporal server start-dev
+
+# Run tests with real Temporal server
+docker run --rm --network host \
+  -e SKIP_TEMPORAL_E2E=false \
+  -e TEMPORAL_ADDRESS=localhost:7233 \
+  airflow-temporal:test
+
+# Or run just the E2E tests
+docker run --rm --network host \
+  -e SKIP_TEMPORAL_E2E=false \
+  -e TEMPORAL_ADDRESS=localhost:7233 \
+  airflow-temporal:test pytest temporal_airflow/tests/test_e2e_real_temporal.py temporal_airflow/tests/test_native_scheduling_e2e.py -v
 ```
 
 ## Project Structure
@@ -235,8 +257,8 @@ docker-compose up -d
    ```bash
    docker run --rm \
      -v $(pwd)/src/temporal_airflow:/opt/airflow/temporal_airflow \
-     -v $(pwd)/examples:/opt/examples \
-     temporal-airflow-test pytest temporal_airflow/tests/ -v
+     -v $(pwd)/examples:/opt/airflow/examples \
+     airflow-temporal:test pytest temporal_airflow/tests/ -v
    ```
 3. For full integration testing, rebuild the base image:
    ```bash
