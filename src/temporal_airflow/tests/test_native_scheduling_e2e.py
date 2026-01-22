@@ -423,9 +423,47 @@ try:
 except ImportError:
     AIRFLOW_AVAILABLE = False
 
-# Check if we should use a real Temporal server (required for Schedule API tests)
-# Set TEMPORAL_TEST_SERVER=real to enable integration tests against real server
-USE_REAL_TEMPORAL_SERVER = os.environ.get("TEMPORAL_TEST_SERVER", "").lower() == "real"
+# Check if real Temporal server is available (required for Schedule API tests)
+def _is_real_temporal_available() -> bool:
+    """Check if a real Temporal server is available for Schedule API tests."""
+    if os.environ.get("SKIP_TEMPORAL_E2E", "").lower() == "true":
+        return False
+
+    addresses_to_try = []
+    env_addr = os.environ.get("TEMPORAL_ADDRESS")
+    if env_addr:
+        addresses_to_try.append(env_addr)
+
+    addresses_to_try.extend([
+        "host.docker.internal:7233",
+        "172.17.0.1:7233",
+        "localhost:7233",
+    ])
+
+    import socket
+    for addr in addresses_to_try:
+        try:
+            if ":" in addr:
+                hostname, port = addr.rsplit(":", 1)
+                port = int(port)
+            else:
+                hostname = addr
+                port = 7233
+
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            result = sock.connect_ex((hostname, port))
+            sock.close()
+
+            if result == 0:
+                os.environ["TEMPORAL_ADDRESS"] = addr
+                return True
+        except Exception:
+            continue
+
+    return False
+
+USE_REAL_TEMPORAL_SERVER = _is_real_temporal_available()
 
 # Skip integration tests if Airflow is not available
 airflow_required = pytest.mark.skipif(
@@ -433,10 +471,10 @@ airflow_required = pytest.mark.skipif(
     reason="Airflow not installed - run in Docker/Breeze environment"
 )
 
-# Skip tests that require Schedule API (not available in time-skipping environment)
+# Skip tests that require Schedule API (requires real Temporal server, not time-skipping environment)
 schedule_api_required = pytest.mark.skipif(
     not USE_REAL_TEMPORAL_SERVER,
-    reason="Temporal Schedule API requires real server - set TEMPORAL_TEST_SERVER=real"
+    reason="Temporal Schedule API requires real server. Start with: temporal server start-dev"
 )
 
 if AIRFLOW_AVAILABLE:
@@ -555,33 +593,83 @@ if AIRFLOW_AVAILABLE:
             """Return the injected test client."""
             return self._test_client
 
+    async def _cleanup_test_schedule(client: Client, schedule_id: str):
+        """Delete a test schedule if it exists."""
+        try:
+            handle = client.get_schedule_handle(schedule_id)
+            await handle.delete()
+        except BaseException:
+            pass  # Schedule doesn't exist or already deleted, that's fine
+
     @asynccontextmanager
     async def create_native_scheduling_orchestrator(native_scheduling: bool = True):
         """
         Create a TemporalOrchestrator with native scheduling support for testing.
 
+        Uses real Temporal server if available (required for Schedule API tests),
+        otherwise falls back to time-skipping environment.
+
         Yields:
             tuple: (orchestrator, env) - orchestrator is ready to use with test client
         """
-        async with await WorkflowEnvironment.start_time_skipping() as env:
-            task_queue = "test-native-scheduling-queue"
+        import time
+        from temporal_airflow.client_config import create_temporal_client
 
-            # Create orchestrator with test client
+        # Use unique task queue to avoid conflicts with other workers
+        task_queue = f"test-native-scheduling-{int(time.time())}"
+        schedule_id = "test-schedule-test_scheduled_dag"
+
+        if USE_REAL_TEMPORAL_SERVER:
+            # Use real Temporal server for Schedule API support
+            client = await create_temporal_client()
+
+            # Clean up any existing test schedule before starting
+            await _cleanup_test_schedule(client, schedule_id)
+
+            # Create orchestrator with real client
             orchestrator = NativeSchedulingOrchestrator(
-                env.client, task_queue, native_scheduling=native_scheduling
+                client, task_queue, native_scheduling=native_scheduling
             )
+
+            # Create a mock env object with the client for test compatibility
+            class MockEnv:
+                def __init__(self, client):
+                    self.client = client
+            mock_env = MockEnv(client)
 
             # Start worker
             async with Worker(
-                env.client,
+                client,
                 task_queue=task_queue,
                 workflows=[ExecuteAirflowDagDeepWorkflow],
                 activities=ALL_ACTIVITIES,
                 activity_executor=ThreadPoolExecutor(max_workers=5),
             ):
-                yield orchestrator, env
+                try:
+                    yield orchestrator, mock_env
+                finally:
+                    # Clean up the test schedule after test
+                    await _cleanup_test_schedule(client, schedule_id)
+        else:
+            # Fall back to time-skipping environment (no Schedule API support)
+            async with await WorkflowEnvironment.start_time_skipping() as env:
+                # Create orchestrator with test client
+                orchestrator = NativeSchedulingOrchestrator(
+                    env.client, task_queue, native_scheduling=native_scheduling
+                )
+
+                # Start worker
+                async with Worker(
+                    env.client,
+                    task_queue=task_queue,
+                    workflows=[ExecuteAirflowDagDeepWorkflow],
+                    activities=ALL_ACTIVITIES,
+                    activity_executor=ThreadPoolExecutor(max_workers=5),
+                ):
+                    yield orchestrator, env
 
     @airflow_required
+    @pytest.mark.usefixtures("airflow_db")
     class TestShouldScheduleDagrunIntegration:
         """Integration tests for should_schedule_dagrun() method."""
 
@@ -677,6 +765,7 @@ if AIRFLOW_AVAILABLE:
                 cleanup()
 
     @airflow_required
+    @pytest.mark.usefixtures("airflow_db")
     class TestSyncPauseStateIntegration:
         """Integration tests for sync_pause_state() method."""
 
@@ -759,6 +848,7 @@ if AIRFLOW_AVAILABLE:
                 cleanup()
 
     @airflow_required
+    @pytest.mark.usefixtures("airflow_db")
     class TestOnDagDeletedIntegration:
         """Integration tests for on_dag_deleted() method."""
 
@@ -810,6 +900,7 @@ if AIRFLOW_AVAILABLE:
                 cleanup()
 
     @airflow_required
+    @pytest.mark.usefixtures("airflow_db")
     class TestOnTimetableChangedIntegration:
         """Integration tests for on_timetable_changed() method."""
 
