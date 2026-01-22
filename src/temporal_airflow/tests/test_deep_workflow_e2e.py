@@ -207,6 +207,7 @@ SYNC_ACTIVITIES = [
 TASK_ACTIVITIES = [run_airflow_task]
 
 
+@pytest.mark.usefixtures("airflow_db")
 class TestDeepWorkflowE2E:
     """End-to-end tests for deep integration workflow."""
 

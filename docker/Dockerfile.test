@@ -38,11 +38,15 @@ RUN ln -sf /opt/airflow/examples/test_sensors.py /opt/airflow/temporal_airflow/t
     ln -sf /opt/airflow/examples/test_loop_structure.py /opt/airflow/temporal_airflow/test_loop_structure.py && \
     ln -sf /opt/airflow/examples/test_mixed_results.py /opt/airflow/temporal_airflow/test_mixed_results.py && \
     ln -sf /opt/airflow/examples/test_parallel.py /opt/airflow/temporal_airflow/test_parallel.py && \
-    ln -sf /opt/airflow/examples/test_scheduled_dag.py /opt/airflow/temporal_airflow/test_scheduled_dag.py
+    ln -sf /opt/airflow/examples/test_scheduled_dag.py /opt/airflow/temporal_airflow/test_scheduled_dag.py && \
+    ln -sf /opt/airflow/examples/test_failing.py /opt/airflow/temporal_airflow/test_failing.py
 
 # Set environment for tests
 ENV AIRFLOW__CORE__DAGS_FOLDER=/opt/airflow/temporal_airflow
 ENV PYTHONPATH=/opt/airflow
+# Skip E2E tests that require a dedicated Temporal server environment
+# These tests need a controlled Temporal setup where no external workers interfere
+ENV SKIP_TEMPORAL_E2E=true
 
 USER airflow
 
