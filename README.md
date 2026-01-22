@@ -78,16 +78,22 @@ When a DAG is triggered (via UI, CLI, or schedule), the `TemporalOrchestrator` i
 
 ```bash
 # Build test image
-docker build -f docker/Dockerfile.test -t temporal-airflow-test .
+docker build -f docker/Dockerfile.test -t airflow-temporal:test .
 
-# Run tests
-docker run --rm temporal-airflow-test
+# Run tests (uses Temporal time-skipping test environment)
+docker run --rm airflow-temporal:test
 
 # Run with local changes
 docker run --rm \
   -v $(pwd)/src/temporal_airflow:/opt/airflow/temporal_airflow \
-  -v $(pwd)/examples:/opt/examples \
-  temporal-airflow-test pytest temporal_airflow/tests/ -v
+  -v $(pwd)/examples:/opt/airflow/examples \
+  airflow-temporal:test pytest temporal_airflow/tests/ -v
+
+# Run E2E tests with real Temporal server (includes Schedule API tests)
+docker run --rm --network host \
+  -e SKIP_TEMPORAL_E2E=false \
+  -e TEMPORAL_ADDRESS=localhost:7233 \
+  airflow-temporal:test
 ```
 
 ## License
