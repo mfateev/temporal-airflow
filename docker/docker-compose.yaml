@@ -49,6 +49,8 @@ x-airflow-common:
     TEMPORAL_ADDRESS: temporal:7233
     TEMPORAL_NAMESPACE: default
     TEMPORAL_TASK_QUEUE: airflow-tasks
+    # Airflow connections (for provider examples)
+    AIRFLOW_CONN_HTTP_DEFAULT: 'http://httpbin.org'
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs

@@ -63,11 +63,21 @@ When a DAG is triggered (via UI, CLI, or schedule), the `TemporalOrchestrator` i
 ## Features
 
 - **Full Airflow Compatibility**: DAGs work unchanged - same operators, same syntax
+- **Provider Support**: Use any Airflow provider (HTTP, AWS, GCP, etc.) - they work seamlessly
 - **Sensor Support**: Airflow sensors use efficient poke() + retry pattern
 - **XCom Support**: Task results passed between tasks via Temporal
 - **Connections & Variables**: Read from Airflow database or environment
 - **Trigger Rules**: All Airflow trigger rules supported via native scheduling logic
 - **Parallel Execution**: Independent tasks run concurrently
+
+## Example DAGs
+
+The `examples/` directory contains sample DAGs demonstrating various features:
+
+- `provider_http_example.py` - HTTP provider with HttpSensor and HttpOperator
+- `test_sensors.py` - Custom sensors with poke() patterns
+- `test_parallel.py` - Parallel task execution
+- `test_scheduled_dag.py` - Scheduled DAG execution
 
 ## Documentation
 
