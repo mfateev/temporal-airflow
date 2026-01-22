@@ -42,6 +42,31 @@ def log_sensor_success(**context):
     return "sensor_passed"
 
 
+def prepare_payload(**context):
+    """Prepare payload for POST request."""
+    return json.dumps({
+        "dag_id": context.get("dag_id"),
+        "run_id": context.get("run_id"),
+        "timestamp": datetime.now().isoformat(),
+    })
+
+
+def verify_post_response(**context):
+    """Verify the POST response."""
+    ti = context.get("ti") or context.get("task_instance")
+    if ti:
+        response = ti.xcom_pull(task_ids="post_data")
+        if response:
+            data = json.loads(response) if isinstance(response, str) else response
+            # httpbin echoes back the posted JSON in the 'json' field
+            return {
+                "success": True,
+                "echoed_data": data.get("json"),
+                "url": data.get("url"),
+            }
+    return {"success": False}
+
+
 # =============================================================================
 # DAG: HTTP Provider Example
 # =============================================================================
@@ -120,14 +145,6 @@ with DAG(
     },
 ) as dag_post:
 
-    def prepare_payload(**context):
-        """Prepare payload for POST request."""
-        return json.dumps({
-            "dag_id": context.get("dag_id"),
-            "run_id": context.get("run_id"),
-            "timestamp": datetime.now().isoformat(),
-        })
-
     # Prepare the payload
     prepare = PythonOperator(
         task_id="prepare_payload",
@@ -143,21 +160,6 @@ with DAG(
         data='{"test": "data", "from": "temporal-airflow"}',
         log_response=True,
     )
-
-    def verify_post_response(**context):
-        """Verify the POST response."""
-        ti = context.get("ti") or context.get("task_instance")
-        if ti:
-            response = ti.xcom_pull(task_ids="post_data")
-            if response:
-                data = json.loads(response) if isinstance(response, str) else response
-                # httpbin echoes back the posted JSON in the 'json' field
-                return {
-                    "success": True,
-                    "echoed_data": data.get("json"),
-                    "url": data.get("url"),
-                }
-        return {"success": False}
 
     verify = PythonOperator(
         task_id="verify_response",
